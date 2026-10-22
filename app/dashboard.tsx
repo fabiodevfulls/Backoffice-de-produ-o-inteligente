@@ -6,7 +6,62 @@ import { exportExcelReport, exportPdfReport } from "./report-export";
 type Role = "supervisor" | "attendant";
 type ActivityKind = "protocol" | "call";
 type ProtocolOutcome = "deferred" | "analysis" | "denied";
-type Tab = "overview" | "calculator" | "records" | "scripts" | "report" | "team";
+type Tab = "overview" | "calculator" | "records" | "scripts" | "breaks" | "report" | "team";
+type BreakId = "first" | "meal" | "last";
+type ScheduledBreak = { id: BreakId; label: string; duration: number; start: string };
+
+const DEFAULT_BREAKS: ScheduledBreak[] = [
+  { id: "first", label: "Primeira pausa", duration: 10, start: "" },
+  { id: "meal", label: "Pausa principal", duration: 20, start: "" },
+  { id: "last", label: "Última pausa", duration: 10, start: "" },
+];
+
+const BREAK_AUDIO: Record<BreakId, string> = {
+  first: "/audio/inicio-pausa-10-minutos-v2.wav",
+  meal: "/audio/inicio-pausa-20-minutos-v2.wav",
+  last: "/audio/inicio-pausa-10-minutos-v2.wav",
+};
+const BREAK_ENDING_AUDIO = "/audio/aviso-fim-da-pausa.wav";
+const breakAudioPlayers = new Map<string, HTMLAudioElement>();
+
+function getBreakAudio(source: string) {
+  const existing = breakAudioPlayers.get(source);
+  if (existing) return existing;
+  const audio = new Audio(source);
+  audio.preload = "auto";
+  breakAudioPlayers.set(source, audio);
+  return audio;
+}
+
+function speakBreakFallback(label: string, moment: "start" | "ending") {
+  if (!("speechSynthesis" in window)) return false;
+  const message = moment === "ending"
+    ? `Atenção. Faltam dois minutos para terminar a ${label.toLowerCase()}.`
+    : `Atenção. A ${label.toLowerCase()} começa em dois minutos.`;
+  const utterance = new SpeechSynthesisUtterance(message);
+  utterance.lang = "pt-BR";
+  const brazilianVoice = window.speechSynthesis.getVoices().find((voice) => voice.lang.toLowerCase().startsWith("pt-br"));
+  if (brazilianVoice) utterance.voice = brazilianVoice;
+  window.speechSynthesis.cancel();
+  window.speechSynthesis.speak(utterance);
+  return true;
+}
+
+async function speakBreakNotice(item: ScheduledBreak, moment: "start" | "ending" = "start") {
+  const source = moment === "ending" ? BREAK_ENDING_AUDIO : BREAK_AUDIO[item.id];
+  try {
+    const audio = getBreakAudio(source);
+    audio.pause();
+    audio.currentTime = 0;
+    audio.muted = false;
+    audio.volume = 0.9;
+    await audio.play();
+    return { played: true, fallback: false, error: "" };
+  } catch (error) {
+    if (speakBreakFallback(item.label, moment)) return { played: true, fallback: true, error: "" };
+    return { played: false, fallback: false, error: error instanceof Error ? error.message : "Áudio indisponível neste navegador." };
+  }
+}
 
 type Typology = { id: number; name: string; seconds: number };
 type Activity = {
@@ -109,6 +164,243 @@ function activityDate(value: string) {
   return `${day}/${month}/${year} • ${time?.slice(0, 5) ?? "--:--"}`;
 }
 
+const triggeredBreakAlerts = new Set<string>();
+
+function BreakSchedule({ visible, userEmail }: { visible: boolean; userEmail: string }) {
+  const storageKey = `backoffice-breaks:${userEmail}:${todayInput()}`;
+  const [breaks, setBreaks] = useState<ScheduledBreak[]>(DEFAULT_BREAKS.map((item) => ({ ...item })));
+  const [scheduledBreaks, setScheduledBreaks] = useState<ScheduledBreak[]>([]);
+  const [configured, setConfigured] = useState(true);
+  const [notice, setNotice] = useState("");
+  const [now, setNow] = useState(() => new Date());
+
+  useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem(storageKey);
+      if (!saved) {
+        setBreaks(DEFAULT_BREAKS.map((item) => ({ ...item })));
+        setScheduledBreaks([]);
+        setConfigured(false);
+        return;
+      }
+      const parsed = JSON.parse(saved) as ScheduledBreak[];
+      const valid = DEFAULT_BREAKS.map((defaults) => {
+        const item = parsed.find((entry) => entry.id === defaults.id);
+        if (!item || typeof item.start !== "string" || !/^([01]\d|2[0-3]):[0-5]\d$/.test(item.start)) {
+          throw new Error("Horários salvos inválidos.");
+        }
+        return { ...defaults, start: item.start };
+      });
+      setBreaks(valid);
+      setScheduledBreaks(valid);
+      setConfigured(true);
+    } catch {
+      setBreaks(DEFAULT_BREAKS.map((item) => ({ ...item })));
+      setScheduledBreaks([]);
+      setConfigured(false);
+    }
+  }, [storageKey]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(new Date()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    const sources = [...new Set([...Object.values(BREAK_AUDIO), BREAK_ENDING_AUDIO])];
+    const unlockAudio = () => {
+      for (const source of sources) {
+        const audio = getBreakAudio(source);
+        audio.volume = 0;
+        audio.play().then(() => {
+          audio.pause();
+          audio.currentTime = 0;
+          audio.volume = 0.9;
+        }).catch(() => undefined);
+      }
+      window.removeEventListener("pointerdown", unlockAudio, true);
+      window.removeEventListener("keydown", unlockAudio, true);
+    };
+    window.addEventListener("pointerdown", unlockAudio, true);
+    window.addEventListener("keydown", unlockAudio, true);
+    return () => {
+      window.removeEventListener("pointerdown", unlockAudio, true);
+      window.removeEventListener("keydown", unlockAudio, true);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!configured) return;
+    const currentSeconds = now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds();
+    for (const item of scheduledBreaks) {
+      if (!item.start) continue;
+      const [hour, minute] = item.start.split(":").map(Number);
+      const startSeconds = hour * 3600 + minute * 60;
+      const endSeconds = startSeconds + item.duration * 60;
+      const secondsUntilStart = startSeconds - currentSeconds;
+      const secondsUntilEnd = endSeconds - currentSeconds;
+      const alertType = secondsUntilStart > 0 && secondsUntilStart <= 120
+        ? "before-start"
+        : currentSeconds >= startSeconds && secondsUntilEnd > 0 && secondsUntilEnd <= 120
+          ? "ending"
+          : currentSeconds >= startSeconds && currentSeconds < endSeconds
+            ? "started"
+            : "";
+      if (!alertType) continue;
+      const alertKey = `${storageKey}:${item.id}:timing-v5:${alertType}`;
+      if (triggeredBreakAlerts.has(alertKey)) continue;
+      try {
+        if (window.localStorage.getItem(alertKey)) {
+          triggeredBreakAlerts.add(alertKey);
+          continue;
+        }
+        window.localStorage.setItem(alertKey, "1");
+      } catch {
+        // The in-memory set below still prevents the alert from repeating in this tab.
+      }
+      triggeredBreakAlerts.add(alertKey);
+      const message = alertType === "before-start"
+        ? `Atenção. A ${item.label.toLowerCase()} começa em dois minutos.`
+        : alertType === "ending"
+          ? `Atenção. Faltam dois minutos para terminar a ${item.label.toLowerCase()}.`
+          : `${item.label} iniciada. O cronômetro ficará visível até o encerramento.`;
+      setNotice(message);
+      if (alertType !== "started") {
+        void speakBreakNotice(item, alertType === "ending" ? "ending" : "start").then((result) => {
+          if (!result.played) setNotice(`${message} Áudio indisponível: ${result.error}`);
+          else if (result.fallback) setNotice(`${message} Aviso falado pela voz disponível neste navegador.`);
+        });
+      }
+    }
+  }, [scheduledBreaks, configured, now, storageKey]);
+
+  function saveBreaks(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (breaks.some((item) => !item.start)) {
+      setNotice("Informe os três horários do Genesys para ativar os avisos.");
+      return;
+    }
+    try {
+      window.localStorage.setItem(storageKey, JSON.stringify(breaks));
+    } catch {
+      setNotice("Não foi possível salvar as pausas neste navegador. Verifique as permissões de armazenamento.");
+      return;
+    }
+    setScheduledBreaks(breaks.map((item) => ({ ...item })));
+    setConfigured(true);
+    setNotice("Pausas do dia salvas. Os avisos sonoros estão ativados.");
+  }
+
+  function statusFor(item: ScheduledBreak) {
+    if (!item.start) return "Horário pendente";
+    const [hour, minute] = item.start.split(":").map(Number);
+    const start = hour * 60 + minute;
+    const current = now.getHours() * 60 + now.getMinutes();
+    if (current < start - 5) return "Programada";
+    if (current < start) return "Começa em breve";
+    if (current < start + item.duration) return "Em andamento";
+    return "Concluída";
+  }
+
+  function countdownFor(item: ScheduledBreak) {
+    if (!item.start) return "Defina o horário para iniciar o cronômetro";
+    const [hour, minute] = item.start.split(":").map(Number);
+    const startSeconds = hour * 3600 + minute * 60;
+    const endSeconds = startSeconds + item.duration * 60;
+    const currentSeconds = now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds();
+    const remaining = currentSeconds < startSeconds ? startSeconds - currentSeconds : Math.max(0, endSeconds - currentSeconds);
+    const minutes = Math.floor(remaining / 60).toString().padStart(2, "0");
+    const seconds = (remaining % 60).toString().padStart(2, "0");
+    if (currentSeconds < startSeconds) return `Começa em ${minutes}:${seconds}`;
+    if (currentSeconds < endSeconds) return `Termina em ${minutes}:${seconds}`;
+    return "Pausa encerrada";
+  }
+
+  const currentSeconds = now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds();
+  const activeBreak = scheduledBreaks.find((item) => {
+    if (!item.start) return false;
+    const [hour, minute] = item.start.split(":").map(Number);
+    const startSeconds = hour * 3600 + minute * 60;
+    return currentSeconds >= startSeconds && currentSeconds < startSeconds + item.duration * 60;
+  });
+  const activeBreakTimer = activeBreak ? countdownFor(activeBreak).replace("Termina em ", "") : "";
+  const floatingTimer = activeBreak ? (
+    <aside className="break-floating-timer" role="timer" aria-live="polite">
+      <span>PAUSA EM ANDAMENTO</span>
+      <strong>{activeBreak.label}</strong>
+      <output>{activeBreakTimer}</output>
+      <small>Tempo restante</small>
+    </aside>
+  ) : null;
+  const noticePopup = notice ? (
+    <div className="break-toast" role="alert">
+      <strong>Aviso de pausa</strong>
+      <span>{notice}</span>
+      <button type="button" onClick={() => setNotice("")}>Fechar</button>
+    </div>
+  ) : null;
+
+  if (!visible && configured) return <>{floatingTimer}{noticePopup}</>;
+
+  return (
+    <div className={!configured && !visible ? "break-modal-backdrop" : "page-stack"}>
+      {floatingTimer}
+      {noticePopup}
+      <section className={`panel break-panel ${!configured && !visible ? "break-modal" : ""}`}>
+        <div className="page-title">
+          <div>
+            <p className="eyebrow">PAUSAS DO GENESYS</p>
+            <h2>Configure as pausas de hoje</h2>
+            <p>Confira os horários no Genesys e informe abaixo. Um aviso toca 2 minutos antes de começar e outro 2 minutos antes de terminar cada pausa.</p>
+          </div>
+        </div>
+        <form onSubmit={saveBreaks}>
+          <div className="break-grid">
+            {breaks.map((item, index) => (
+              <div className="break-card" key={item.id}>
+                <span>{item.label}</span>
+                <strong>{item.duration} minutos</strong>
+                <input
+                  aria-label={`Horário da ${item.label.toLowerCase()}`}
+                  type="time"
+                  required
+                  value={item.start}
+                  onChange={(event) => setBreaks((current) => current.map((entry, entryIndex) => entryIndex === index ? { ...entry, start: event.target.value } : entry))}
+                />
+                <small>{statusFor(item)}</small>
+                <output className="break-countdown" aria-live="polite">{countdownFor(item)}</output>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() => {
+                    setNotice(`Reproduzindo o aviso de início da ${item.label.toLowerCase()}...`);
+                    void speakBreakNotice(item).then((result) => setNotice(result.played
+                      ? `Aviso de início da ${item.label.toLowerCase()} reproduzido${result.fallback ? " com a voz disponível no navegador" : " com sucesso"}.`
+                      : `Áudio indisponível: ${result.error}`));
+                  }}
+                >Ouvir aviso de início</button>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() => {
+                    setNotice(`Reproduzindo o aviso de encerramento da ${item.label.toLowerCase()}...`);
+                    void speakBreakNotice(item, "ending").then((result) => setNotice(result.played
+                      ? `Aviso de encerramento da ${item.label.toLowerCase()} reproduzido${result.fallback ? " com a voz disponível no navegador" : " com sucesso"}.`
+                      : `Áudio indisponível: ${result.error}`));
+                  }}
+                >Ouvir aviso de encerramento</button>
+              </div>
+            ))}
+          </div>
+          <div className="modal-actions">
+            <button className="primary-button" type="submit">Salvar pausas e ativar avisos</button>
+          </div>
+        </form>
+      </section>
+    </div>
+  );
+}
+
 export default function Dashboard({
   authUser,
   accessToken,
@@ -161,7 +453,8 @@ export default function Dashboard({
         { id: "overview", label: "Visão geral", icon: "⌂" },
         { id: "calculator", label: "Calculadora", icon: "▦" },
         { id: "records", label: "Meus registros", icon: "▤" },
-        { id: "scripts", label: "Scripts", icon: "✎" },
+        { id: "scripts", label: "Scripts Inteligentes", icon: "✎" },
+        { id: "breaks", label: "Minhas pausas", icon: "◷" },
         { id: "report", label: "Meu relatório", icon: "▥" },
       ];
 
@@ -261,6 +554,12 @@ export default function Dashboard({
               )}
               {tab === "calculator" && !isSupervisor && <Calculator data={data} />}
               {tab === "scripts" && !isSupervisor && <Scripts />}
+              {!isSupervisor && (
+                <BreakSchedule
+                  visible={tab === "breaks"}
+                  userEmail={data.currentUser.email || authUser.email}
+                />
+              )}
               {tab === "records" && (
                 <Records
                   activities={data.activities}

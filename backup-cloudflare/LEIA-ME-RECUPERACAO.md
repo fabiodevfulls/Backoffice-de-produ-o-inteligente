@@ -1,6 +1,8 @@
 # Recuperação Cloudflare — referência para comparação
 
-Esta pasta guarda 44 arquivos JavaScript e manifestos extraídos da implantação do Cloudflare. Eles são arquivos compilados, não substituem o código-fonte da aplicação na raiz do repositório. Foram adicionados para preservar o material recuperado e permitir comparação sem alterar o código original.
+Esta pasta guarda 44 arquivos JavaScript e manifestos extraídos da implantação do Cloudflare. São arquivos compilados e não substituem os fontes da aplicação.
+
+O código que já existia foi mantido. A fonte recebeu uma implementação adicional de “Minhas pausas”, baseada na variante recuperada que corresponde às capturas: três pausas de 10, 20 e 10 minutos, configuração diária por atendente, contagem regressiva e avisos dois minutos antes do início e do fim. O gerador de scripts existente também foi mantido. A variante recuperada mostra o rótulo “Scripts Inteligentes”, mas não contém uma lógica diferente do gerador de troca de titularidade já presente no código-fonte.
 
 ## Limites desta cópia
 
@@ -16,4 +18,6 @@ O conjunto recuperado não representa uma cópia completa do deploy atualmente a
 - `audio/pausa-2-20-minutos.wav`
 - `audio/pausa-3-10-minutos.wav`
 
-O sistema em produção continua sendo a referência da versão funcionando. Estes arquivos servem para recuperação e comparação; não são um pacote pronto para publicar por cima da implantação atual.
+A tela usa esses arquivos se estiverem disponíveis; como não vieram nesta recuperação, há uma alternativa que fala o aviso usando a voz em português disponível no navegador. Essa fala pode não ser a mesma voz do Cloudflare.
+
+O sistema em produção continua sendo a referência da versão funcionando. Este material e as alterações de fonte são para recuperação e revisão; não constituem uma cópia exata pronta para substituir a implantação atual.
