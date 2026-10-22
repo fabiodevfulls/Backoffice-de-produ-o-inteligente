@@ -173,6 +173,14 @@ export async function ensureSchema() {
       last_sent_at TEXT NOT NULL,
       created_at TEXT NOT NULL
     )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS password_reset_verifications (
+      email TEXT PRIMARY KEY,
+      code_hash TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_sent_at TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )`),
     db.prepare("CREATE INDEX IF NOT EXISTS activities_user_email_idx ON activities (user_email)"),
     db.prepare("CREATE INDEX IF NOT EXISTS activities_occurred_at_idx ON activities (occurred_at)"),
     db.prepare("CREATE INDEX IF NOT EXISTS activities_kind_idx ON activities (kind)"),

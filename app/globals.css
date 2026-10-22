@@ -227,8 +227,14 @@ td a { color: var(--blue); font-weight: 700; text-decoration: none; }
 .report-awaiting-selection { padding: 24px; }
 .overview-scope-filter { display: flex; align-items: end; justify-content: space-between; gap: 20px; padding: 18px 20px; }
 .overview-scope-filter h2, .overview-scope-filter p { margin: 4px 0 0; }
-.overview-scope-filter label { display: grid; gap: 7px; min-width: 290px; color: #c5d1df; font-size: 11px; font-weight: 800; }
-.overview-scope-filter select { height: 44px; border: 1px solid var(--green); border-radius: 8px; padding: 0 12px; background: #071526; color: #fff; font-weight: 800; }
+.overview-scope-filter > div { flex: 1; min-width: 180px; }
+.overview-scope-filter label { display: grid; gap: 7px; min-width: min(220px, 100%); color: #c5d1df; font-size: 11px; font-weight: 800; }
+.overview-scope-filter select, .overview-scope-filter input { width: 100%; height: 44px; border: 1px solid var(--green); border-radius: 8px; padding: 0 12px; background: #071526; color: #fff; font-weight: 800; }
+.overview-scope-filter input { color-scheme: dark; }
+.monthly-team-panel { grid-column: 1 / -1; min-width: 0; }
+.monthly-team-panel .section-heading p { margin: 6px 0 0; color: var(--muted); font-size: 12px; }
+.monthly-loading { min-height: 100px; display: grid; place-items: center; color: var(--muted); }
+.supervisor-grid > .recent-panel { grid-column: 1 / -1; }
 .report-period-card { padding: 16px; transition: .18s ease; }
 .report-period-card.active { border-color: var(--green); box-shadow: 0 0 0 1px rgba(163, 230, 53, .2); }
 .period-select { width: 100%; display: grid; grid-template-columns: 1fr auto; gap: 5px 12px; border: 0; padding: 0 0 14px; background: transparent; color: #fff; text-align: left; cursor: pointer; }
@@ -313,6 +319,8 @@ td a { color: var(--blue); font-weight: 700; text-decoration: none; }
   .script-preview-panel { position: static; }
   .attendants-layout { grid-template-columns: 1fr; }
   .record-period-filters { grid-template-columns: 1fr; }
+  .overview-scope-filter { align-items: stretch; flex-direction: column; }
+  .overview-scope-filter label { min-width: 0; }
 }
 
 @media (max-width: 600px) {

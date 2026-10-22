@@ -20,6 +20,10 @@ async function authEnv() {
   };
 }
 
+export async function getConfiguredAuthEmail() {
+  return (await authEnv()).AUTH_EMAIL;
+}
+
 function base64url(input: Uint8Array | string) {
   const bytes = typeof input === "string" ? new TextEncoder().encode(input) : input;
   let binary = "";
@@ -50,6 +54,16 @@ async function secureEqual(left: string, right: string) {
 export async function authenticate(email: string, password: string) {
   const env = await authEnv();
   const normalizedEmail = email.trim().toLowerCase();
+  if (env.DB) {
+    const user = await env.DB.prepare(`SELECT password_hash AS passwordHash, password_salt AS passwordSalt,
+      active, registration_complete AS registrationComplete FROM users WHERE email = ?`)
+      .bind(normalizedEmail)
+      .first<{ passwordHash: string | null; passwordSalt: string | null; active: number; registrationComplete: number }>();
+    if (user?.passwordHash && user.passwordSalt) {
+      if (!user.active || !user.registrationComplete) return null;
+      return (await verifyPassword(password, user.passwordSalt, user.passwordHash)) ? normalizedEmail : null;
+    }
+  }
   if (env.AUTH_PASSWORD) {
     const [emailMatches, passwordMatches] = await Promise.all([
       secureEqual(normalizedEmail, env.AUTH_EMAIL),
@@ -57,13 +71,7 @@ export async function authenticate(email: string, password: string) {
     ]);
     if (emailMatches && passwordMatches) return normalizedEmail;
   }
-  if (!env.DB) return null;
-  const user = await env.DB.prepare(`SELECT password_hash AS passwordHash, password_salt AS passwordSalt
-    FROM users WHERE email = ? AND active = 1 AND registration_complete = 1`)
-    .bind(normalizedEmail)
-    .first<{ passwordHash: string | null; passwordSalt: string | null }>();
-  if (!user?.passwordHash || !user.passwordSalt) return null;
-  return (await verifyPassword(password, user.passwordSalt, user.passwordHash)) ? normalizedEmail : null;
+  return null;
 }
 
 export async function hashPassword(password: string, salt = crypto.getRandomValues(new Uint8Array(16))) {

@@ -32,6 +32,7 @@ type TeamMember = {
   total: number;
   productiveSeconds: number;
 };
+type MonthlyTeamMember = TeamMember & { activeDays: number };
 type DashboardData = {
   currentUser: {
     email: string;
@@ -67,6 +68,7 @@ const todayInput = () => {
   const offset = date.getTimezoneOffset();
   return new Date(date.getTime() - offset * 60_000).toISOString().slice(0, 10);
 };
+const monthInput = () => todayInput().slice(0, 7);
 
 const timeInput = () => new Date().toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" });
 
@@ -377,24 +379,67 @@ function Overview({
   accessToken: string;
 }) {
   const [overviewEmail, setOverviewEmail] = useState("all");
+  const [productionMonth, setProductionMonth] = useState(monthInput);
+  const [monthlyTeam, setMonthlyTeam] = useState<MonthlyTeamMember[]>([]);
+  const [monthlyActivities, setMonthlyActivities] = useState<Activity[]>([]);
+  const [monthlyLoading, setMonthlyLoading] = useState(false);
+  const [monthlyError, setMonthlyError] = useState("");
+  const [monthlyReload, setMonthlyReload] = useState(0);
+
+  useEffect(() => {
+    if (!isSupervisor || !accessToken) return;
+    const controller = new AbortController();
+    setMonthlyLoading(true);
+    setMonthlyError("");
+    const params = new URLSearchParams({ month: productionMonth });
+    if (overviewEmail !== "all") params.set("email", overviewEmail);
+    void fetch(`/api/supervisor/monthly-production?${params}`, {
+      cache: "no-store",
+      headers: { authorization: `Bearer ${accessToken}` },
+      signal: controller.signal,
+    }).then(async (response) => {
+      const result = await response.json() as {
+        month?: string;
+        team?: MonthlyTeamMember[];
+        recentActivities?: Activity[];
+        error?: string;
+      };
+      if (!response.ok) throw new Error(result.error || "Não foi possível carregar a produção mensal.");
+      setMonthlyTeam(result.team ?? []);
+      setMonthlyActivities(result.recentActivities ?? []);
+    }).catch((loadError: unknown) => {
+      if (controller.signal.aborted) return;
+      setMonthlyError(loadError instanceof Error ? loadError.message : "Não foi possível carregar a produção mensal.");
+      setMonthlyTeam([]);
+      setMonthlyActivities([]);
+    }).finally(() => {
+      if (!controller.signal.aborted) setMonthlyLoading(false);
+    });
+    return () => controller.abort();
+  }, [isSupervisor, accessToken, productionMonth, overviewEmail, monthlyReload]);
+
   const selectedOverviewMember = data.team.find((member) => member.email === overviewEmail);
-  const overviewActivities = overviewEmail === "all"
-    ? data.activities
-    : data.activities.filter((activity) => activity.userEmail === overviewEmail);
-  const overviewTeam = selectedOverviewMember ? [selectedOverviewMember] : data.team;
-  const overviewData = { ...data, activities: overviewActivities, team: overviewTeam };
-  const teamProductivity = data.team.length
-    ? data.team.reduce((sum, member) => sum + attendantAverageProductivity(data, member.email), 0) / data.team.length
+  const overviewActivities = isSupervisor
+    ? monthlyActivities
+    : overviewEmail === "all"
+      ? data.activities
+      : data.activities.filter((activity) => activity.userEmail === overviewEmail);
+  const visibleMonthlyTeam = overviewEmail === "all"
+    ? monthlyTeam
+    : monthlyTeam.filter((member) => member.email === overviewEmail);
+  const monthlyProductivityRows = visibleMonthlyTeam.filter((member) => member.activeDays > 0);
+  const monthlyAverageProductivity = monthlyProductivityRows.length
+    ? monthlyProductivityRows.reduce((sum, member) => sum + member.productiveSeconds / (data.settings.workdaySeconds * member.activeDays), 0) / monthlyProductivityRows.length
     : 0;
-  const selectedProductivity = selectedOverviewMember
-    ? attendantAverageProductivity(data, selectedOverviewMember.email)
-    : teamProductivity;
+  const monthLabel = productionMonth
+    ? new Date(`${productionMonth}-01T12:00:00`).toLocaleDateString("pt-BR", { month: "long", year: "numeric" })
+    : "mês selecionado";
   const cards = isSupervisor
     ? [
-        { label: selectedOverviewMember?.name ?? "Atendentes", value: selectedOverviewMember ? "1" : String(data.team.length), icon: "◎", tone: "blue" },
-        { label: "Protocolos registrados", value: String(overviewActivities.filter((a) => a.kind === "protocol").reduce((s, a) => s + a.quantity, 0)), icon: "▤", tone: "blue" },
-        { label: "Ligações registradas", value: String(overviewActivities.filter((a) => a.kind === "call").reduce((s, a) => s + a.quantity, 0)), icon: "◖", tone: "green" },
-        { label: selectedOverviewMember ? "Produtividade média do atendente" : "Média de produtividade da equipe", value: formatPercent(selectedProductivity), icon: "↗", tone: "green" },
+        { label: selectedOverviewMember ? "Atividades no mês" : "Atendentes com produção", value: selectedOverviewMember ? String(visibleMonthlyTeam.reduce((sum, member) => sum + member.total, 0)) : String(monthlyTeam.filter((member) => member.total > 0).length), icon: "◎", tone: "blue" },
+        { label: "Protocolos no mês", value: String(visibleMonthlyTeam.reduce((sum, member) => sum + member.protocols, 0)), icon: "▤", tone: "blue" },
+        { label: "Ligações no mês", value: String(visibleMonthlyTeam.reduce((sum, member) => sum + member.calls, 0)), icon: "◖", tone: "green" },
+        { label: "Produtividade média no mês", value: formatPercent(monthlyAverageProductivity), icon: "↗", tone: "green" },
       ]
     : [
         { label: "Produtividade hoje", value: formatPercent(productivity), icon: "↗", tone: "green" },
@@ -405,7 +450,8 @@ function Overview({
 
   return (
     <div className="page-stack">
-      {isSupervisor ? <section className="panel overview-scope-filter"><div><p className="eyebrow">VISÃO DA PRODUTIVIDADE</p><h2>{selectedOverviewMember ? selectedOverviewMember.name : "Equipe geral"}</h2><p>Escolha a equipe completa ou um atendente para atualizar todos os indicadores desta tela.</p></div><label><span>Visualizar</span><select value={overviewEmail} onChange={(event) => setOverviewEmail(event.target.value)}><option value="all">Equipe geral</option>{data.team.map((member) => <option key={member.email} value={member.email}>{member.name}</option>)}</select></label></section> : null}
+      {isSupervisor ? <section className="panel overview-scope-filter"><div><p className="eyebrow">PRODUÇÃO MENSAL DA EQUIPE</p><h2>{selectedOverviewMember ? selectedOverviewMember.name : "Equipe geral"}</h2><p>Consulte a produção do mês e, se quiser, filtre por atendente.</p></div><label><span>Mês</span><input type="month" value={productionMonth} onChange={(event) => setProductionMonth(event.target.value || monthInput())} /></label><label><span>Atendente</span><select value={overviewEmail} onChange={(event) => setOverviewEmail(event.target.value)}><option value="all">Equipe geral</option>{data.team.map((member) => <option key={member.email} value={member.email}>{member.name}</option>)}</select></label></section> : null}
+      {isSupervisor && monthlyError ? <div className="alert error" role="alert">{monthlyError}<button type="button" onClick={() => setMonthlyReload((count) => count + 1)}>Tentar novamente</button></div> : null}
       <section className="metric-grid">
         {cards.map((card) => (
           <article className="metric-card" key={card.label}>
@@ -417,7 +463,7 @@ function Overview({
 
       {isSupervisor ? (
         <div className="dashboard-grid supervisor-grid">
-          <TeamSummary data={overviewData} compact />
+          <MonthlyTeamSummary team={visibleMonthlyTeam} monthLabel={monthLabel} loading={monthlyLoading} workdaySeconds={data.settings.workdaySeconds} />
           <RecentActivities activities={overviewActivities} supervisor />
         </div>
       ) : (
@@ -1008,6 +1054,20 @@ function ProductionReports({ data, isSupervisor }: { data: DashboardData; isSupe
 
 function Team({ data }: { data: DashboardData }) {
   return <div className="page-stack"><div className="page-title"><div><p className="eyebrow">ACESSO DA SUPERVISÃO</p><h2>Desempenho da equipe</h2><p>Somente visualização: nenhum registro pode ser criado ou alterado aqui.</p></div></div><TeamSummary data={data} /></div>;
+}
+
+function MonthlyTeamSummary({ team, monthLabel, loading, workdaySeconds }: { team: MonthlyTeamMember[]; monthLabel: string; loading: boolean; workdaySeconds: number }) {
+  return (
+    <section className="panel team-panel monthly-team-panel">
+      <div className="section-heading"><div><p className="eyebrow">PRODUÇÃO DO MÊS</p><h2>Resultado por atendente</h2><p>Período: {monthLabel}</p></div><span className="permission-tag readonly">Somente leitura</span></div>
+      {loading ? <p className="monthly-loading" role="status">Carregando produção mensal...</p>
+        : team.length ? <div className="table-scroll"><table><thead><tr><th>Atendente</th><th>Protocolos</th><th>Ligações</th><th>Total</th><th>Tempo produtivo</th><th>Dias ativos</th><th>Produtividade média</th></tr></thead><tbody>{team.map((member) => {
+          const score = member.activeDays ? member.productiveSeconds / (workdaySeconds * member.activeDays) : 0;
+          return <tr key={member.email}><td><strong>{member.name}</strong><small>{member.email}</small></td><td>{member.protocols}</td><td>{member.calls}</td><td><strong>{member.total}</strong></td><td>{formatDuration(member.productiveSeconds)}</td><td>{member.activeDays}</td><td>{member.activeDays ? <span className={`score-pill ${score >= 0.9 ? "good" : "low"}`}>{formatPercent(score)}</span> : "—"}</td></tr>;
+        })}</tbody></table></div>
+          : <EmptyState title="Nenhum atendente identificado" text={`Os atendentes aparecerão aqui quando houver produção em ${monthLabel}.`} />}
+    </section>
+  );
 }
 
 function TeamSummary({ data, compact = false }: { data: DashboardData; compact?: boolean }) {
