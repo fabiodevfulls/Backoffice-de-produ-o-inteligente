@@ -1,5 +1,8 @@
+import { isDemoReportAccount } from "./lib/report-selection";
+
 type Activity = { userName: string; userEmail: string; kind: "protocol" | "call"; protocol: string | null; outcome: "deferred" | "analysis" | "denied" | null; typologyName: string; quantity: number; occurredAt: string; distributionState: string | null };
-type Options = { title: string; subtitle: string; activities: Activity[] };
+type ReportAttendant = { name: string; email: string };
+type Options = { title: string; subtitle: string; activities: Activity[]; attendants?: ReportAttendant[] };
 
 function save(blob: Blob, filename: string) {
   const url = URL.createObjectURL(blob);
@@ -21,6 +24,34 @@ function totals(activities: Activity[]) {
     types.set(label, (types.get(label) ?? 0) + item.quantity);
   });
   return { protocols, calls, total: protocols + calls, types: [...types].sort((a, b) => b[1] - a[1]) };
+}
+
+function reportAttendants(options: Options, activities: Activity[]) {
+  const attendants = new Map<string, ReportAttendant>();
+  for (const attendant of options.attendants ?? []) {
+    const email = attendant.email.trim().toLowerCase();
+    if (email && !isDemoReportAccount(email, attendant.name)) attendants.set(email, { name: attendant.name.trim() || email, email });
+  }
+  for (const activity of activities) {
+    const email = activity.userEmail.trim().toLowerCase();
+    if (email && !isDemoReportAccount(email, activity.userName) && !attendants.has(email)) attendants.set(email, { name: activity.userName.trim() || email, email });
+  }
+  return [...attendants.values()].sort((a, b) => a.name.localeCompare(b.name, "pt-BR") || a.email.localeCompare(b.email));
+}
+
+function uniqueSheetNames(attendants: ReportAttendant[]) {
+  const used = new Set(["resumo"]);
+  return attendants.map((attendant) => {
+    const base = (attendant.name.split("").map((character) => "\\/?*[]:".includes(character) ? " " : character).join("").trim() || "Atendente").slice(0, 31);
+    let name = base;
+    let suffix = 2;
+    while (used.has(name.toLocaleLowerCase("pt-BR"))) {
+      const ending = ` ${suffix++}`;
+      name = `${base.slice(0, 31 - ending.length)}${ending}`;
+    }
+    used.add(name.toLocaleLowerCase("pt-BR"));
+    return name;
+  });
 }
 
 function exportExcelReportLegacy(options: Options) {
@@ -97,31 +128,22 @@ function createZip(files: Record<string, Uint8Array>) {
 }
 
 export async function exportExcelReport(options: Options) {
-  const activities = options.activities.filter((item) => item.kind === "protocol");
+  const activities = options.activities.filter((item) => item.kind === "protocol" && !isDemoReportAccount(item.userEmail, item.userName));
   const sum = totals(activities);
+  const attendants = reportAttendants(options, activities);
+  const attendantSheetNames = uniqueSheetNames(attendants);
   const banner = new Uint8Array(await (await fetch("/report-energy-banner.png")).arrayBuffer());
   const detailTitleRow = 17 + sum.types.length;
   const detailHeaderRow = detailTitleRow + 1;
   const detailStartRow = detailHeaderRow + 1;
-  let groupedRow = detailStartRow;
-  const groupedDetailRows: string[] = [];
-  const groupedMerges: string[] = [];
-  const activitiesByDay = new Map<string, Activity[]>();
-  [...activities].sort((a, b) => a.occurredAt.localeCompare(b.occurredAt)).forEach((item) => {
-    const day = item.occurredAt.slice(0, 10);
-    activitiesByDay.set(day, [...(activitiesByDay.get(day) ?? []), item]);
+  const groupedDetailRows = attendants.map((attendant, index) => {
+    const personActivities = activities.filter((item) => item.userEmail.trim().toLowerCase() === attendant.email);
+    const row = detailStartRow + index;
+    const style = index % 2 ? 9 : 8;
+    return `<row r="${row}" ht="23" customHeight="1">${xlsxCell(`A${row}`, attendant.name, style)}${xlsxCell(`B${row}`, attendant.email, style)}${xlsxCell(`C${row}`, totals(personActivities).protocols, style)}${xlsxCell(`D${row}`, personActivities.length, style)}</row>`;
   });
-  activitiesByDay.forEach((items, day) => {
-    groupedDetailRows.push(`<row r="${groupedRow}" ht="24" customHeight="1">${xlsxCell(`A${groupedRow}`, `DIA ${new Date(`${day}T12:00:00`).toLocaleDateString("pt-BR")}`, 6)}</row>`);
-    groupedMerges.push(`<mergeCell ref="A${groupedRow}:I${groupedRow}"/>`);
-    groupedRow++;
-    items.forEach((item, index) => {
-      const style = index % 2 ? 9 : 8;
-      const protocolStyle = index % 2 ? 12 : 11;
-      groupedDetailRows.push(`<row r="${groupedRow}" ht="22" customHeight="1">${xlsxCell(`A${groupedRow}`, item.userName, style)}${xlsxCell(`B${groupedRow}`, item.userEmail, style)}${xlsxCell(`C${groupedRow}`, item.kind === "protocol" ? "Protocolo" : "Ligação", style)}${xlsxCell(`D${groupedRow}`, item.distributionState || "-", style)}${xlsxCell(`E${groupedRow}`, item.protocol || "-", protocolStyle)}${xlsxCell(`F${groupedRow}`, outcomeLabel(item), style)}${xlsxCell(`G${groupedRow}`, item.typologyName, style)}${xlsxCell(`H${groupedRow}`, item.quantity, style)}${xlsxCell(`I${groupedRow}`, dateLabel(item.occurredAt), style)}</row>`);
-      groupedRow++;
-    });
-  });
+  if (!groupedDetailRows.length) groupedDetailRows.push(`<row r="${detailStartRow}" ht="23" customHeight="1">${xlsxCell(`A${detailStartRow}`, "Nenhum atendente encontrado no período.", 8)}</row>`);
+  const lastSummaryRow = detailStartRow + groupedDetailRows.length - 1;
   const summaryRows = [
     `<row r="7" ht="34" customHeight="1">${xlsxCell("A7", options.title, 1)}</row>`,
     `<row r="8" ht="22" customHeight="1">${xlsxCell("A8", `${options.subtitle} • Gerado em ${new Date().toLocaleString("pt-BR")}`, 2)}</row>`,
@@ -134,38 +156,46 @@ export async function exportExcelReport(options: Options) {
       const style = index % 2 ? 9 : 8;
       return `<row r="${row}" ht="22" customHeight="1">${xlsxCell(`A${row}`, name, style)}${xlsxCell(`F${row}`, count, style)}</row>`;
     }),
-    `<row r="${detailTitleRow}" ht="25" customHeight="1">${xlsxCell(`A${detailTitleRow}`, "REGISTROS DO PERÍODO", 6)}</row>`,
-    `<row r="${detailHeaderRow}" ht="25" customHeight="1">${["Atendente", "E-mail", "Tipo", "Estado", "Protocolo", "Parecer", "Tipologia", "Quantidade", "Data e hora"].map((value, index) => xlsxCell(`${String.fromCharCode(65 + index)}${detailHeaderRow}`, value, 7)).join("")}</row>`,
+    `<row r="${detailTitleRow}" ht="25" customHeight="1">${xlsxCell(`A${detailTitleRow}`, "RESUMO POR ATENDENTE", 6)}</row>`,
+    `<row r="${detailHeaderRow}" ht="25" customHeight="1">${["Atendente", "E-mail", "Protocolos", "Registros"].map((value, index) => xlsxCell(`${String.fromCharCode(65 + index)}${detailHeaderRow}`, value, 7)).join("")}</row>`,
     ...groupedDetailRows,
   ].join("");
-  const lastSummaryRow = Math.max(detailStartRow, groupedRow - 1);
-  const recordRows = activities.map((item, index) => {
-    const row = 4 + index;
-    const style = index % 2 ? 9 : 8;
-    const protocolStyle = index % 2 ? 12 : 11;
-    return `<row r="${row}" ht="21" customHeight="1">${xlsxCell(`A${row}`, item.userName, style)}${xlsxCell(`B${row}`, item.userEmail, style)}${xlsxCell(`C${row}`, item.kind === "protocol" ? "Protocolo" : "Ligação", style)}${xlsxCell(`D${row}`, item.distributionState || "-", style)}${xlsxCell(`E${row}`, item.protocol || "-", protocolStyle)}${xlsxCell(`F${row}`, outcomeLabel(item), style)}${xlsxCell(`G${row}`, item.typologyName, style)}${xlsxCell(`H${row}`, item.quantity, style)}${xlsxCell(`I${row}`, dateLabel(item.occurredAt), style)}</row>`;
-  }).join("");
-  const lastRecordRow = Math.max(4, 3 + activities.length);
 
   const sheet = (body: string, dimension: string, columns: string, merges: string, drawing = false, freeze = "", filter = "") => `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><dimension ref="${dimension}"/><sheetViews><sheetView workbookViewId="0" showGridLines="0">${freeze}</sheetView></sheetViews><sheetFormatPr defaultRowHeight="18"/>${columns}<sheetData>${body}</sheetData>${filter ? `<autoFilter ref="${filter}"/>` : ""}${merges}${drawing ? `<drawing r:id="rId1"/>` : ""}</worksheet>`;
-  const summaryMerges = `<mergeCells count="${7 + groupedMerges.length}"><mergeCell ref="A7:I7"/><mergeCell ref="A8:I8"/><mergeCell ref="B10:H10"/><mergeCell ref="B11:H11"/><mergeCell ref="A13:I13"/><mergeCell ref="A14:F14"/><mergeCell ref="A${detailTitleRow}:I${detailTitleRow}"/>${groupedMerges.join("")}</mergeCells>`;
-  const recordHeader = `<row r="1" ht="32" customHeight="1">${xlsxCell("A1", "REGISTROS DETALHADOS", 1)}</row><row r="3" ht="25" customHeight="1">${["Atendente","E-mail","Tipo","Estado","Protocolo","Parecer","Tipologia","Quantidade","Data e hora"].map((value, index) => xlsxCell(`${String.fromCharCode(65 + index)}3`, value, 7)).join("")}</row>`;
-  const summarySheet = sheet(summaryRows, `A1:I${lastSummaryRow}`, `<cols><col min="1" max="1" width="31" customWidth="1" style="10"/><col min="2" max="4" width="17" customWidth="1" style="10"/><col min="5" max="5" width="27" customWidth="1" style="10"/><col min="6" max="6" width="18" customWidth="1" style="10"/><col min="7" max="7" width="22" customWidth="1" style="10"/><col min="8" max="9" width="17" customWidth="1" style="10"/></cols>`, summaryMerges, true);
-  const recordsSheet = sheet(recordHeader + recordRows, `A1:I${lastRecordRow}`, `<cols><col min="1" max="1" width="25" customWidth="1" style="10"/><col min="2" max="2" width="38" customWidth="1" style="10"/><col min="3" max="4" width="17" customWidth="1" style="10"/><col min="5" max="5" width="27" customWidth="1" style="10"/><col min="6" max="6" width="18" customWidth="1" style="10"/><col min="7" max="7" width="32" customWidth="1" style="10"/><col min="8" max="8" width="13" customWidth="1" style="10"/><col min="9" max="9" width="22" customWidth="1" style="10"/></cols>`, `<mergeCells count="1"><mergeCell ref="A1:I1"/></mergeCells>`, false, `<pane ySplit="3" topLeftCell="A4" activePane="bottomLeft" state="frozen"/>`, `A3:I${lastRecordRow}`);
+  const summaryMerges = `<mergeCells count="6"><mergeCell ref="A7:I7"/><mergeCell ref="A8:I8"/><mergeCell ref="B10:H10"/><mergeCell ref="B11:H11"/><mergeCell ref="A13:I13"/><mergeCell ref="A${detailTitleRow}:I${detailTitleRow}"/></mergeCells>`;
+  const summarySheet = sheet(summaryRows, `A1:I${lastSummaryRow}`, `<cols><col min="1" max="1" width="31" customWidth="1" style="10"/><col min="2" max="2" width="38" customWidth="1" style="10"/><col min="3" max="4" width="17" customWidth="1" style="10"/><col min="5" max="5" width="27" customWidth="1" style="10"/><col min="6" max="6" width="18" customWidth="1" style="10"/><col min="7" max="7" width="22" customWidth="1" style="10"/><col min="8" max="9" width="17" customWidth="1" style="10"/></cols>`, summaryMerges, true);
+  const attendeeColumns = `<cols><col min="1" max="1" width="25" customWidth="1" style="10"/><col min="2" max="2" width="38" customWidth="1" style="10"/><col min="3" max="4" width="17" customWidth="1" style="10"/><col min="5" max="5" width="27" customWidth="1" style="10"/><col min="6" max="6" width="18" customWidth="1" style="10"/><col min="7" max="7" width="32" customWidth="1" style="10"/><col min="8" max="8" width="13" customWidth="1" style="10"/><col min="9" max="9" width="22" customWidth="1" style="10"/></cols>`;
+  const attendantSheets = attendants.map((attendant, index) => {
+    const personActivities = activities
+      .filter((item) => item.userEmail.trim().toLowerCase() === attendant.email)
+      .sort((a, b) => a.occurredAt.localeCompare(b.occurredAt));
+    const personTotal = totals(personActivities).protocols;
+    const title = `<row r="1" ht="32" customHeight="1">${xlsxCell("A1", "PRODUÇÃO INDIVIDUAL", 1)}</row><row r="2" ht="22" customHeight="1">${xlsxCell("A2", `${attendant.name} • ${attendant.email} • ${options.subtitle}`, 2)}</row><row r="4" ht="22" customHeight="1">${xlsxCell("A4", "QUANTIDADE DE PROTOCOLOS", 3)}</row><row r="5" ht="34" customHeight="1">${xlsxCell("A5", personTotal, 5)}</row><row r="7" ht="25" customHeight="1">${["Atendente", "E-mail", "Tipo", "Estado", "Protocolo", "Parecer", "Tipologia", "Quantidade", "Data e hora"].map((value, column) => xlsxCell(`${String.fromCharCode(65 + column)}7`, value, 7)).join("")}</row>`;
+    const details = personActivities.length ? personActivities.map((item, rowIndex) => {
+      const row = 8 + rowIndex;
+      const style = rowIndex % 2 ? 9 : 8;
+      const protocolStyle = rowIndex % 2 ? 12 : 11;
+      return `<row r="${row}" ht="22" customHeight="1">${xlsxCell(`A${row}`, item.userName, style)}${xlsxCell(`B${row}`, item.userEmail, style)}${xlsxCell(`C${row}`, "Protocolo", style)}${xlsxCell(`D${row}`, item.distributionState || "-", style)}${xlsxCell(`E${row}`, item.protocol || "-", protocolStyle)}${xlsxCell(`F${row}`, outcomeLabel(item), style)}${xlsxCell(`G${row}`, item.typologyName, style)}${xlsxCell(`H${row}`, item.quantity, style)}${xlsxCell(`I${row}`, dateLabel(item.occurredAt), style)}</row>`;
+    }).join("") : `<row r="8" ht="24" customHeight="1">${xlsxCell("A8", "Nenhum protocolo no período.", 8)}</row>`;
+    const lastRow = Math.max(8, 7 + personActivities.length);
+    const merges = `<mergeCells count="${personActivities.length ? 4 : 5}"><mergeCell ref="A1:I1"/><mergeCell ref="A2:I2"/><mergeCell ref="A4:H4"/><mergeCell ref="A5:H5"/>${personActivities.length ? "" : "<mergeCell ref=\"A8:I8\"/>"}</mergeCells>`;
+    const content = sheet(title + details, `A1:I${lastRow}`, attendeeColumns, merges, false, `<pane ySplit="7" topLeftCell="A8" activePane="bottomLeft" state="frozen"/>`, personActivities.length ? `A7:I${lastRow}` : "");
+    return { name: attendantSheetNames[index], content };
+  });
 
   const files: Record<string, Uint8Array> = {
-    "[Content_Types].xml": strToU8(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/><Override PartName="/xl/drawings/drawing1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/></Types>`),
+    "[Content_Types].xml": strToU8(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>${attendantSheets.map((_, index) => `<Override PartName="/xl/worksheets/sheet${index + 2}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join("")}<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/><Override PartName="/xl/drawings/drawing1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/></Types>`),
     "_rels/.rels": strToU8(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>`),
-    "xl/workbook.xml": strToU8(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Resumo" sheetId="1" r:id="rId1"/><sheet name="Registros" sheetId="2" r:id="rId2"/></sheets></workbook>`),
-    "xl/_rels/workbook.xml.rels": strToU8(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`),
+    "xl/workbook.xml": strToU8(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><bookViews><workbookView activeTab="0"/></bookViews><sheets><sheet name="Resumo" sheetId="1" r:id="rId1"/>${attendantSheets.map((item, index) => `<sheet name="${xml(item.name)}" sheetId="${index + 2}" r:id="rId${index + 2}"/>`).join("")}</sheets></workbook>`),
+    "xl/_rels/workbook.xml.rels": strToU8(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>${attendantSheets.map((_, index) => `<Relationship Id="rId${index + 2}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${index + 2}.xml"/>`).join("")}<Relationship Id="rId${attendantSheets.length + 2}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`),
     "xl/worksheets/sheet1.xml": strToU8(summarySheet),
-    "xl/worksheets/sheet2.xml": strToU8(recordsSheet),
     "xl/worksheets/_rels/sheet1.xml.rels": strToU8(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>`),
     "xl/drawings/drawing1.xml": strToU8(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><xdr:twoCellAnchor editAs="oneCell"><xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>8</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>6</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:pic><xdr:nvPicPr><xdr:cNvPr id="1" name="Faixa ARII"/><xdr:cNvPicPr/></xdr:nvPicPr><xdr:blipFill><a:blip r:embed="rId1"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>`),
     "xl/drawings/_rels/drawing1.xml.rels": strToU8(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/></Relationships>`),
     "xl/media/image1.png": banner,
-    "xl/styles.xml": strToU8(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="4"><font><sz val="11"/><name val="Aptos"/></font><font><b/><color rgb="FFFFFFFF"/><sz val="22"/><name val="Aptos Display"/></font><font><color rgb="FFD6E3F2"/><sz val="11"/><name val="Aptos"/></font><font><b/><color rgb="FF111827"/><sz val="11"/><name val="Aptos"/></font></fonts><fills count="8"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF071526"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FF152B45"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FF203A5A"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFAEEA18"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFF5BF16"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFEEF4F8"/></patternFill></fill></fills><borders count="2"><border/><border><left style="thin"><color rgb="FFD9E1E9"/></left><right style="thin"><color rgb="FFD9E1E9"/></right><top style="thin"><color rgb="FFD9E1E9"/></top><bottom style="thin"><color rgb="FFD9E1E9"/></bottom></border></borders><cellXfs count="13"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/><xf numFmtId="0" fontId="1" fillId="2" borderId="0" applyAlignment="1"><alignment vertical="center"/></xf><xf numFmtId="0" fontId="2" fillId="2" borderId="0"/><xf numFmtId="0" fontId="2" fillId="3" borderId="0" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf><xf numFmtId="1" fontId="1" fillId="4" borderId="0" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf><xf numFmtId="1" fontId="3" fillId="5" borderId="0" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf><xf numFmtId="0" fontId="1" fillId="2" borderId="0"/><xf numFmtId="0" fontId="3" fillId="6" borderId="1"/><xf numFmtId="0" fontId="2" fillId="2" borderId="1" applyAlignment="1"><alignment vertical="center"/></xf><xf numFmtId="0" fontId="2" fillId="3" borderId="1" applyAlignment="1"><alignment vertical="center"/></xf><xf numFmtId="0" fontId="2" fillId="2" borderId="0"/><xf numFmtId="49" fontId="2" fillId="2" borderId="1" applyNumberFormat="1" applyAlignment="1"><alignment horizontal="left" vertical="center" indent="1"/></xf><xf numFmtId="49" fontId="2" fillId="3" borderId="1" applyNumberFormat="1" applyAlignment="1"><alignment horizontal="left" vertical="center" indent="1"/></xf></cellXfs></styleSheet>`),
+    "xl/styles.xml": strToU8(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="4"><font><sz val="11"/><name val="Aptos"/></font><font><b/><color rgb="FFFFFFFF"/><sz val="22"/><name val="Aptos Display"/></font><font><color rgb="FFD6E3F2"/><sz val="11"/><name val="Aptos"/></font><font><b/><color rgb="FF111827"/><sz val="11"/><name val="Aptos"/></font></fonts><fills count="8"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF071526"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FF152B45"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FF203A5A"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFAEEA18"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FF38BDF8"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFEEF4F8"/></patternFill></fill></fills><borders count="2"><border/><border><left style="thin"><color rgb="FFD9E1E9"/></left><right style="thin"><color rgb="FFD9E1E9"/></right><top style="thin"><color rgb="FFD9E1E9"/></top><bottom style="thin"><color rgb="FFD9E1E9"/></bottom></border></borders><cellXfs count="13"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/><xf numFmtId="0" fontId="1" fillId="2" borderId="0" applyAlignment="1"><alignment vertical="center"/></xf><xf numFmtId="0" fontId="2" fillId="2" borderId="0"/><xf numFmtId="0" fontId="2" fillId="3" borderId="0" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf><xf numFmtId="1" fontId="1" fillId="4" borderId="0" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf><xf numFmtId="1" fontId="3" fillId="5" borderId="0" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf><xf numFmtId="0" fontId="1" fillId="2" borderId="0"/><xf numFmtId="0" fontId="3" fillId="6" borderId="1"/><xf numFmtId="0" fontId="2" fillId="2" borderId="1" applyAlignment="1"><alignment vertical="center"/></xf><xf numFmtId="0" fontId="2" fillId="3" borderId="1" applyAlignment="1"><alignment vertical="center"/></xf><xf numFmtId="0" fontId="2" fillId="2" borderId="0"/><xf numFmtId="49" fontId="2" fillId="2" borderId="1" applyNumberFormat="1" applyAlignment="1"><alignment horizontal="left" vertical="center" indent="1"/></xf><xf numFmtId="49" fontId="2" fillId="3" borderId="1" applyNumberFormat="1" applyAlignment="1"><alignment horizontal="left" vertical="center" indent="1"/></xf></cellXfs></styleSheet>`),
   };
+  attendantSheets.forEach((item, index) => { files[`xl/worksheets/sheet${index + 2}.xml`] = strToU8(item.content); });
   save(new Blob([createZip(files) as BlobPart], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }), `relatorio-backoffice-producao-${filename(options.subtitle)}.xlsx`);
 }
 
@@ -176,28 +206,45 @@ const pdfText = (value: unknown) => String(value ?? "").normalize("NFD").replace
 const short = (value: string, length: number) => { const text = pdfText(value); return text.length > length ? `${text.slice(0, length - 3)}...` : text; };
 
 export function exportPdfReport(options: Options) {
-  const activities = options.activities.filter((item) => item.kind === "protocol");
-  const sum = totals(activities); const perPage = 15;
-  const pdfDays = new Map<string, Activity[]>();
-  [...activities].sort((a, b) => a.occurredAt.localeCompare(b.occurredAt)).forEach((item) => { const day = item.occurredAt.slice(0, 10); pdfDays.set(day, [...(pdfDays.get(day) ?? []), item]); });
-  const pages = [...pdfDays.entries()].flatMap(([day, items]) => Array.from({ length: Math.ceil(items.length / perPage) }, (_, i) => ({ day, items: items.slice(i * perPage, (i + 1) * perPage) })));
-  if (!pages.length) pages.push({ day: "", items: [] });
-  const streams = pages.map(({ day, items }, page) => {
+  const activities = options.activities.filter((item) => item.kind === "protocol" && !isDemoReportAccount(item.userEmail, item.userName));
+  const perPage = 15;
+  const attendants = reportAttendants(options, activities);
+  const pages: Array<{ attendant: ReportAttendant; total: number; day: string; items: Activity[] }> = [];
+  for (const attendant of attendants) {
+    const personActivities = activities
+      .filter((item) => item.userEmail.trim().toLowerCase() === attendant.email)
+      .sort((a, b) => a.occurredAt.localeCompare(b.occurredAt));
+    const personTotal = totals(personActivities).protocols;
+    const byDay = new Map<string, Activity[]>();
+    personActivities.forEach((item) => {
+      const day = item.occurredAt.slice(0, 10);
+      byDay.set(day, [...(byDay.get(day) ?? []), item]);
+    });
+    if (!byDay.size) pages.push({ attendant, total: personTotal, day: "", items: [] });
+    for (const [day, items] of byDay) {
+      for (let offset = 0; offset < items.length; offset += perPage) {
+        pages.push({ attendant, total: personTotal, day, items: items.slice(offset, offset + perPage) });
+      }
+    }
+  }
+  if (!pages.length) pages.push({ attendant: { name: "Nenhum atendente", email: "" }, total: 0, day: "", items: [] });
+  const streams = pages.map(({ attendant, total, day, items }, page) => {
     const dayLabel = day ? ` | DIA ${new Date(`${day}T12:00:00`).toLocaleDateString("pt-BR")}` : "";
-    const c = ["0.043 0.094 0.157 rg 0 0 842 595 re f", "0.949 0.718 0.020 rg 0 531 842 64 re f", `BT /F2 20 Tf 0.06 0.06 0.06 rg 34 560 Td (BACKOFFICE PRODUCAO | ${pdfText(options.title)}) Tj ET`, `BT /F1 9 Tf 0.12 0.18 0.25 rg 34 543 Td (${pdfText(options.subtitle)} | Gerado em ${pdfText(new Date().toLocaleString("pt-BR"))}) Tj ET`, "0.125 0.192 0.286 rg 34 478 774 42 re f", `BT /F1 8 Tf 0.68 0.76 0.86 rg 48 504 Td (QUANTIDADE DE PROTOCOLOS) Tj ET`, `BT /F2 18 Tf 1 1 1 rg 48 485 Td (${sum.protocols}) Tj ET`, "0.949 0.718 0.020 rg 34 438 774 26 re f", `BT /F2 7 Tf 0.06 0.06 0.06 rg 40 447 Td (ATENDENTE${pdfText(dayLabel)}) Tj 135 0 Td (TIPO / UF) Tj 90 0 Td (PROTOCOLO COMPLETO) Tj 120 0 Td (PARECER) Tj 95 0 Td (TIPOLOGIA) Tj 185 0 Td (DATA) Tj 90 0 Td (QTD) Tj ET`];
+    const personLabel = `${attendant.name} • ${attendant.email}${dayLabel}`.slice(0, 100);
+    const c = ["0.043 0.094 0.157 rg 0 0 842 595 re f", "0.220 0.741 0.973 rg 0 531 842 64 re f", `BT /F2 20 Tf 0.06 0.06 0.06 rg 34 560 Td (BACKOFFICE PRODUCAO | ${pdfText(options.title)}) Tj ET`, `BT /F1 9 Tf 0.12 0.18 0.25 rg 34 543 Td (${pdfText(options.subtitle)} | Gerado em ${pdfText(new Date().toLocaleString("pt-BR"))}) Tj ET`, "0.125 0.192 0.286 rg 34 478 774 42 re f", `BT /F1 8 Tf 0.68 0.76 0.86 rg 48 504 Td (QUANTIDADE DE PROTOCOLOS DO ATENDENTE) Tj ET`, `BT /F2 18 Tf 1 1 1 rg 48 485 Td (${total}) Tj ET`, "0.125 0.192 0.286 rg 34 444 774 26 re f", `BT /F2 9 Tf 1 1 1 rg 44 453 Td (ATENDENTE: ${pdfText(personLabel)}) Tj ET`, "0.220 0.741 0.973 rg 34 410 774 26 re f", "BT /F2 7 Tf 0.06 0.06 0.06 rg 40 419 Td (TIPO / UF) Tj 135 0 Td (PROTOCOLO COMPLETO) Tj 110 0 Td (PARECER) Tj 90 0 Td (TIPOLOGIA) Tj 175 0 Td (DATA) Tj 140 0 Td (QTD) Tj ET"];
     items.forEach((item, i) => {
-      const y = 420 - i * 24;
+      const y = 392 - i * 22;
       const protocolValue = pdfText(item.protocol || "-");
       const protocolSize = protocolValue.length > 24 ? 5 : protocolValue.length > 19 ? 6 : 7;
-      if (i % 2 === 0) c.push(`0.067 0.133 0.216 rg 34 ${y - 7} 774 22 re f`);
-      c.push(`BT /F1 7 Tf 0.9 0.94 0.98 rg 40 ${y} Td (${short(item.userName, 24)}) Tj ET`);
-      c.push(`BT /F1 7 Tf 0.9 0.94 0.98 rg 175 ${y} Td (Protocolo / ${pdfText(item.distributionState || "-")}) Tj ET`);
-      c.push(`BT /F1 ${protocolSize} Tf 1 1 1 rg 265 ${y} Td (${protocolValue}) Tj ET`);
-      c.push(`BT /F1 7 Tf 0.9 0.94 0.98 rg 385 ${y} Td (${pdfText(outcomeLabel(item))}) Tj ET`);
-      c.push(`BT /F1 7 Tf 0.9 0.94 0.98 rg 480 ${y} Td (${short(item.typologyName, 29)}) Tj ET`);
-      c.push(`BT /F1 7 Tf 0.9 0.94 0.98 rg 665 ${y} Td (${pdfText(new Date(item.occurredAt).toLocaleDateString("pt-BR"))}) Tj ET`);
-      c.push(`BT /F1 7 Tf 0.9 0.94 0.98 rg 755 ${y} Td (${item.quantity}) Tj ET`);
+      if (i % 2 === 0) c.push(`0.067 0.133 0.216 rg 34 ${y - 7} 774 20 re f`);
+      c.push(`BT /F1 7 Tf 0.9 0.94 0.98 rg 40 ${y} Td (Protocolo / ${pdfText(item.distributionState || "-")}) Tj ET`);
+      c.push(`BT /F1 ${protocolSize} Tf 1 1 1 rg 175 ${y} Td (${protocolValue}) Tj ET`);
+      c.push(`BT /F1 7 Tf 0.9 0.94 0.98 rg 285 ${y} Td (${pdfText(outcomeLabel(item))}) Tj ET`);
+      c.push(`BT /F1 7 Tf 0.9 0.94 0.98 rg 375 ${y} Td (${short(item.typologyName, 28)}) Tj ET`);
+      c.push(`BT /F1 7 Tf 0.9 0.94 0.98 rg 560 ${y} Td (${pdfText(new Date(item.occurredAt).toLocaleDateString("pt-BR"))}) Tj ET`);
+      c.push(`BT /F1 7 Tf 0.9 0.94 0.98 rg 690 ${y} Td (${item.quantity}) Tj ET`);
     });
+    if (!items.length) c.push("BT /F1 9 Tf 0.75 0.82 0.9 rg 40 380 Td (Nenhum protocolo neste periodo.) Tj ET");
     c.push(`BT /F1 8 Tf 0.55 0.65 0.76 rg 34 28 Td (Backoffice Producao - Relatorio de protocolos) Tj 690 0 Td (Pagina ${page + 1}/${pages.length}) Tj ET`); return c.join("\n");
   });
   const regular = 3 + streams.length * 2, bold = regular + 1;

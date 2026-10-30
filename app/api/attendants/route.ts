@@ -20,7 +20,7 @@ export async function GET(request: Request) {
       COALESCE(SUM(CASE WHEN a.kind = 'call' THEN a.quantity ELSE 0 END), 0) AS calls,
       MAX(a.occurred_at) AS lastActivityAt
       FROM users u LEFT JOIN activities a ON a.user_email = u.email
-      WHERE u.role = 'attendant' AND u.email <> ?
+      WHERE u.role = 'attendant' AND COALESCE(u.is_demo, 0) = 0 AND u.email <> ?
       GROUP BY u.email, u.name, u.employee_code, u.active, u.created_at ORDER BY u.name`).bind(ADMIN_EMAIL).all();
     return Response.json({ attendants: result.results ?? [], limit: MAX_ATTENDANTS });
   } catch (error) {
@@ -36,7 +36,7 @@ export async function PATCH(request: Request) {
     if (!email || typeof payload.active !== "boolean") return Response.json({ error: "Informe o atendente e o novo status." }, { status: 400 });
     if (isAdminEmail(email)) return Response.json({ error: "Não é permitido alterar o acesso de um administrador." }, { status: 403 });
     const db = await getDatabase();
-    const result = await db.prepare("UPDATE users SET active = ? WHERE lower(email) = ? AND role = 'attendant'")
+    const result = await db.prepare("UPDATE users SET active = ? WHERE lower(email) = ? AND role = 'attendant' AND COALESCE(is_demo, 0) = 0")
       .bind(payload.active ? 1 : 0, email).run();
     if (!result.meta.changes) return Response.json({ error: "Atendente não encontrado." }, { status: 404 });
     return Response.json({ message: payload.active ? "Acesso reativado com sucesso." : "Acesso suspenso com sucesso." });
@@ -61,7 +61,7 @@ export async function POST(request: Request) {
     if (email === ADMIN_EMAIL) return Response.json({ error: "Esse e-mail pertence ao administrador." }, { status: 400 });
 
     const db = await getDatabase();
-    const count = await db.prepare("SELECT COUNT(*) AS total FROM users WHERE role = 'attendant' AND email <> ?").bind(ADMIN_EMAIL).first<{ total: number }>();
+    const count = await db.prepare("SELECT COUNT(*) AS total FROM users WHERE role = 'attendant' AND COALESCE(is_demo, 0) = 0 AND email <> ?").bind(ADMIN_EMAIL).first<{ total: number }>();
     if ((count?.total ?? 0) >= MAX_ATTENDANTS) return Response.json({ error: `Limite de ${MAX_ATTENDANTS} atendentes atingido.` }, { status: 409 });
     const exists = await db.prepare("SELECT 1 AS found FROM users WHERE email = ?").bind(email).first<{ found: number }>();
     if (exists?.found) return Response.json({ error: "Já existe um cadastro com esse e-mail." }, { status: 409 });
@@ -85,11 +85,11 @@ export async function DELETE(request: Request) {
     if (!email) return Response.json({ error: "Informe o atendente." }, { status: 400 });
     if (isAdminEmail(email)) return Response.json({ error: "Não é permitido excluir um administrador." }, { status: 403 });
     const db = await getDatabase();
-    const user = await db.prepare("SELECT role FROM users WHERE lower(email) = ?").bind(email).first<{ role: string }>();
-    if (!user || user.role !== "attendant") return Response.json({ error: "Atendente não encontrado." }, { status: 404 });
+    const user = await db.prepare("SELECT role, COALESCE(is_demo, 0) AS isDemo FROM users WHERE lower(email) = ?").bind(email).first<{ role: string; isDemo: number }>();
+    if (!user || user.role !== "attendant" || user.isDemo) return Response.json({ error: "Atendente não encontrado." }, { status: 404 });
     await db.batch([
       db.prepare("DELETE FROM registration_verifications WHERE lower(email) = ?").bind(email),
-      db.prepare("DELETE FROM users WHERE lower(email) = ? AND role = 'attendant'").bind(email),
+      db.prepare("DELETE FROM users WHERE lower(email) = ? AND role = 'attendant' AND COALESCE(is_demo, 0) = 0").bind(email),
     ]);
     return Response.json({ message: "Cadastro excluído. Os registros de produção foram preservados." });
   } catch (error) {

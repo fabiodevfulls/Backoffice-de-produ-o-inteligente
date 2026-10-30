@@ -1,0 +1,18 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "backoffice-producao-recuperado",
+  "main": "./worker/index.ts",
+  "compatibility_date": "2026-10-22",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "AUTH_EMAIL": "fabiodasilvaa82@gmail.com",
+    "DEMO_ACCESS_ENABLED": "true"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "backoffice-producao-recuperado-db",
+      "database_id": "8ccf22f1-220a-4112-b6c9-f9758e1d59b3"
+    }
+  ],
+}

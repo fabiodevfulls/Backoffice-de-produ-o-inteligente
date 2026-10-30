@@ -1,12 +1,72 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { ChangeEvent, FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import Image from "next/image";
 import { exportExcelReport, exportPdfReport } from "./report-export";
+import { filterReportSelection, isDemoReportAccount, teamMemberProductivity } from "./lib/report-selection";
+import { buildSapAdditionalFields, DENIAL_REASON_GROUPS, formatDenialReason } from "./intelligent-script.js";
+import { dailyProductionMetrics, productivityBand, summarizeSelectedDay } from "./lib/daily-productivity";
+import DemoAccessCard from "./demo-access/demo-access-card";
 
 type Role = "supervisor" | "attendant";
 type ActivityKind = "protocol" | "call";
 type ProtocolOutcome = "deferred" | "analysis" | "denied";
-type Tab = "overview" | "calculator" | "records" | "scripts" | "report" | "team";
+type Tab = "overview" | "calculator" | "records" | "scripts" | "breaks" | "report" | "team" | "profile";
+type BreakId = "first" | "meal" | "last";
+type ScheduledBreak = { id: BreakId; label: string; duration: number; start: string };
+
+const DEFAULT_BREAKS: ScheduledBreak[] = [
+  { id: "first", label: "Primeira pausa", duration: 10, start: "" },
+  { id: "meal", label: "Pausa principal", duration: 20, start: "" },
+  { id: "last", label: "Última pausa", duration: 10, start: "" },
+];
+
+const BREAK_AUDIO: Record<BreakId, string> = {
+  first: "/audio/inicio-pausa-10-minutos-v2.wav",
+  meal: "/audio/inicio-pausa-20-minutos-v2.wav",
+  last: "/audio/inicio-pausa-10-minutos-v2.wav",
+};
+const BREAK_ENDING_AUDIO = "/audio/aviso-fim-da-pausa.wav";
+const breakAudioPlayers = new Map<string, HTMLAudioElement>();
+
+function getBreakAudio(source: string) {
+  const existing = breakAudioPlayers.get(source);
+  if (existing) return existing;
+  const audio = new Audio(source);
+  audio.preload = "auto";
+  breakAudioPlayers.set(source, audio);
+  return audio;
+}
+
+function speakBreakFallback(label: string, moment: "start" | "ending") {
+  if (!("speechSynthesis" in window)) return false;
+  const message = moment === "ending"
+    ? `Atenção. Faltam dois minutos para terminar a ${label.toLowerCase()}.`
+    : `Atenção. A ${label.toLowerCase()} começa em dois minutos.`;
+  const utterance = new SpeechSynthesisUtterance(message);
+  utterance.lang = "pt-BR";
+  const brazilianVoice = window.speechSynthesis.getVoices().find((voice) => voice.lang.toLowerCase().startsWith("pt-br"));
+  if (brazilianVoice) utterance.voice = brazilianVoice;
+  window.speechSynthesis.cancel();
+  window.speechSynthesis.speak(utterance);
+  return true;
+}
+
+async function speakBreakNotice(item: ScheduledBreak, moment: "start" | "ending" = "start") {
+  const source = moment === "ending" ? BREAK_ENDING_AUDIO : BREAK_AUDIO[item.id];
+  try {
+    const audio = getBreakAudio(source);
+    audio.pause();
+    audio.currentTime = 0;
+    audio.muted = false;
+    audio.volume = 0.9;
+    await audio.play();
+    return { played: true, fallback: false, error: "" };
+  } catch (error) {
+    if (speakBreakFallback(item.label, moment)) return { played: true, fallback: true, error: "" };
+    return { played: false, fallback: false, error: error instanceof Error ? error.message : "Áudio indisponível neste navegador." };
+  }
+}
 
 type Typology = { id: number; name: string; seconds: number };
 type Activity = {
@@ -31,7 +91,10 @@ type TeamMember = {
   calls: number;
   total: number;
   productiveSeconds: number;
+  activeDays: number;
 };
+type MonthlyTeamMember = TeamMember;
+type AttendantDayProduction = { date: string; email: string; name: string; productiveSeconds: number; protocols: number; calls: number; total: number };
 type DashboardData = {
   currentUser: {
     email: string;
@@ -40,6 +103,7 @@ type DashboardData = {
     employeeCode: string | null;
     registrationComplete: boolean;
     isAdmin: boolean;
+    profilePhoto: string | null;
   };
   typologies: Typology[];
   activities: Activity[];
@@ -55,6 +119,7 @@ const EMPTY_DATA: DashboardData = {
     employeeCode: null,
     registrationComplete: false,
     isAdmin: false,
+    profilePhoto: null,
   },
   typologies: [],
   activities: [],
@@ -67,6 +132,7 @@ const todayInput = () => {
   const offset = date.getTimezoneOffset();
   return new Date(date.getTime() - offset * 60_000).toISOString().slice(0, 10);
 };
+const monthInput = () => todayInput().slice(0, 7);
 
 const timeInput = () => new Date().toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" });
 
@@ -79,17 +145,6 @@ function formatDuration(totalSeconds: number) {
 
 function formatPercent(value: number) {
   return `${(value * 100).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%`;
-}
-
-function attendantAverageProductivity(data: DashboardData, email: string) {
-  const activities = data.activities.filter((activity) => activity.userEmail === email);
-  const activeDays = new Set(activities.map((activity) => activity.occurredAt.slice(0, 10))).size;
-  if (!activeDays) return 0;
-  const productiveSeconds = activities.reduce(
-    (sum, activity) => sum + activity.durationSeconds * activity.quantity,
-    0,
-  );
-  return productiveSeconds / (data.settings.workdaySeconds * activeDays);
 }
 
 function kindLabel(kind: ActivityKind) {
@@ -109,12 +164,254 @@ function activityDate(value: string) {
   return `${day}/${month}/${year} • ${time?.slice(0, 5) ?? "--:--"}`;
 }
 
+const triggeredBreakAlerts = new Set<string>();
+
+function BreakSchedule({ visible, userEmail }: { visible: boolean; userEmail: string }) {
+  const storageKey = `backoffice-breaks:${userEmail}:${todayInput()}`;
+  const [breaks, setBreaks] = useState<ScheduledBreak[]>(DEFAULT_BREAKS.map((item) => ({ ...item })));
+  const [scheduledBreaks, setScheduledBreaks] = useState<ScheduledBreak[]>([]);
+  const [configured, setConfigured] = useState(true);
+  const [notice, setNotice] = useState("");
+  const [now, setNow] = useState(() => new Date());
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      try {
+        const saved = window.localStorage.getItem(storageKey);
+        if (!saved) {
+          setBreaks(DEFAULT_BREAKS.map((item) => ({ ...item })));
+          setScheduledBreaks([]);
+          setConfigured(false);
+          return;
+        }
+        const parsed = JSON.parse(saved) as ScheduledBreak[];
+        const valid = DEFAULT_BREAKS.map((defaults) => {
+          const item = parsed.find((entry) => entry.id === defaults.id);
+          if (!item || typeof item.start !== "string" || !/^([01]\d|2[0-3]):[0-5]\d$/.test(item.start)) {
+            throw new Error("Horários salvos inválidos.");
+          }
+          return { ...defaults, start: item.start };
+        });
+        setBreaks(valid);
+        setScheduledBreaks(valid);
+        setConfigured(true);
+      } catch {
+        setBreaks(DEFAULT_BREAKS.map((item) => ({ ...item })));
+        setScheduledBreaks([]);
+        setConfigured(false);
+      }
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [storageKey]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(new Date()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    const sources = [...new Set([...Object.values(BREAK_AUDIO), BREAK_ENDING_AUDIO])];
+    const unlockAudio = () => {
+      for (const source of sources) {
+        const audio = getBreakAudio(source);
+        audio.volume = 0;
+        audio.play().then(() => {
+          audio.pause();
+          audio.currentTime = 0;
+          audio.volume = 0.9;
+        }).catch(() => undefined);
+      }
+      window.removeEventListener("pointerdown", unlockAudio, true);
+      window.removeEventListener("keydown", unlockAudio, true);
+    };
+    window.addEventListener("pointerdown", unlockAudio, true);
+    window.addEventListener("keydown", unlockAudio, true);
+    return () => {
+      window.removeEventListener("pointerdown", unlockAudio, true);
+      window.removeEventListener("keydown", unlockAudio, true);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!configured) return;
+    const currentSeconds = now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds();
+    for (const item of scheduledBreaks) {
+      if (!item.start) continue;
+      const [hour, minute] = item.start.split(":").map(Number);
+      const startSeconds = hour * 3600 + minute * 60;
+      const endSeconds = startSeconds + item.duration * 60;
+      const secondsUntilStart = startSeconds - currentSeconds;
+      const secondsUntilEnd = endSeconds - currentSeconds;
+      const alertType = secondsUntilStart > 0 && secondsUntilStart <= 120
+        ? "before-start"
+        : currentSeconds >= startSeconds && secondsUntilEnd > 0 && secondsUntilEnd <= 120
+          ? "ending"
+          : currentSeconds >= startSeconds && currentSeconds < endSeconds
+            ? "started"
+            : "";
+      if (!alertType) continue;
+      const alertKey = `${storageKey}:${item.id}:timing-v5:${alertType}`;
+      if (triggeredBreakAlerts.has(alertKey)) continue;
+      try {
+        if (window.localStorage.getItem(alertKey)) {
+          triggeredBreakAlerts.add(alertKey);
+          continue;
+        }
+        window.localStorage.setItem(alertKey, "1");
+      } catch {
+        // The in-memory set below still prevents the alert from repeating in this tab.
+      }
+      triggeredBreakAlerts.add(alertKey);
+      const message = alertType === "before-start"
+        ? `Atenção. A ${item.label.toLowerCase()} começa em dois minutos.`
+        : alertType === "ending"
+          ? `Atenção. Faltam dois minutos para terminar a ${item.label.toLowerCase()}.`
+          : `${item.label} iniciada. O cronômetro ficará visível até o encerramento.`;
+      window.setTimeout(() => setNotice(message), 0);
+      if (alertType !== "started") {
+        void speakBreakNotice(item, alertType === "ending" ? "ending" : "start").then((result) => {
+          if (!result.played) setNotice(`${message} Áudio indisponível: ${result.error}`);
+          else if (result.fallback) setNotice(`${message} Aviso falado pela voz disponível neste navegador.`);
+        });
+      }
+    }
+  }, [scheduledBreaks, configured, now, storageKey]);
+
+  function saveBreaks(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (breaks.some((item) => !item.start)) {
+      setNotice("Informe os três horários do Genesys para ativar os avisos.");
+      return;
+    }
+    try {
+      window.localStorage.setItem(storageKey, JSON.stringify(breaks));
+    } catch {
+      setNotice("Não foi possível salvar as pausas neste navegador. Verifique as permissões de armazenamento.");
+      return;
+    }
+    setScheduledBreaks(breaks.map((item) => ({ ...item })));
+    setConfigured(true);
+    setNotice("Pausas do dia salvas. Os avisos sonoros estão ativados.");
+  }
+
+  function statusFor(item: ScheduledBreak) {
+    if (!item.start) return "Horário pendente";
+    const [hour, minute] = item.start.split(":").map(Number);
+    const start = hour * 60 + minute;
+    const current = now.getHours() * 60 + now.getMinutes();
+    if (current < start - 5) return "Programada";
+    if (current < start) return "Começa em breve";
+    if (current < start + item.duration) return "Em andamento";
+    return "Concluída";
+  }
+
+  function countdownFor(item: ScheduledBreak) {
+    if (!item.start) return "Defina o horário para iniciar o cronômetro";
+    const [hour, minute] = item.start.split(":").map(Number);
+    const startSeconds = hour * 3600 + minute * 60;
+    const endSeconds = startSeconds + item.duration * 60;
+    const currentSeconds = now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds();
+    const remaining = currentSeconds < startSeconds ? startSeconds - currentSeconds : Math.max(0, endSeconds - currentSeconds);
+    const minutes = Math.floor(remaining / 60).toString().padStart(2, "0");
+    const seconds = (remaining % 60).toString().padStart(2, "0");
+    if (currentSeconds < startSeconds) return `Começa em ${minutes}:${seconds}`;
+    if (currentSeconds < endSeconds) return `Termina em ${minutes}:${seconds}`;
+    return "Pausa encerrada";
+  }
+
+  const currentSeconds = now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds();
+  const activeBreak = scheduledBreaks.find((item) => {
+    if (!item.start) return false;
+    const [hour, minute] = item.start.split(":").map(Number);
+    const startSeconds = hour * 3600 + minute * 60;
+    return currentSeconds >= startSeconds && currentSeconds < startSeconds + item.duration * 60;
+  });
+  const activeBreakTimer = activeBreak ? countdownFor(activeBreak).replace("Termina em ", "") : "";
+  const floatingTimer = activeBreak ? (
+    <aside className="break-floating-timer" role="timer" aria-live="polite">
+      <span>PAUSA EM ANDAMENTO</span>
+      <strong>{activeBreak.label}</strong>
+      <output>{activeBreakTimer}</output>
+      <small>Tempo restante</small>
+    </aside>
+  ) : null;
+  const noticePopup = notice ? (
+    <div className="break-toast" role="alert">
+      <strong>Aviso de pausa</strong>
+      <span>{notice}</span>
+      <button type="button" onClick={() => setNotice("")}>Fechar</button>
+    </div>
+  ) : null;
+
+  if (!visible && configured) return <>{floatingTimer}{noticePopup}</>;
+
+  return (
+    <div className={!configured && !visible ? "break-modal-backdrop" : "page-stack"}>
+      {floatingTimer}
+      {noticePopup}
+      <section className={`panel break-panel ${!configured && !visible ? "break-modal" : ""}`}>
+        <div className="page-title">
+          <div>
+            <p className="eyebrow">PAUSAS DO GENESYS</p>
+            <h2>Configure as pausas de hoje</h2>
+            <p>Confira os horários no Genesys e informe abaixo. Um aviso toca 2 minutos antes de começar e outro 2 minutos antes de terminar cada pausa.</p>
+          </div>
+        </div>
+        <form onSubmit={saveBreaks}>
+          <div className="break-grid">
+            {breaks.map((item, index) => (
+              <div className="break-card" key={item.id}>
+                <span>{item.label}</span>
+                <strong>{item.duration} minutos</strong>
+                <input
+                  aria-label={`Horário da ${item.label.toLowerCase()}`}
+                  type="time"
+                  required
+                  value={item.start}
+                  onChange={(event) => setBreaks((current) => current.map((entry, entryIndex) => entryIndex === index ? { ...entry, start: event.target.value } : entry))}
+                />
+                <small>{statusFor(item)}</small>
+                <output className="break-countdown" aria-live="polite">{countdownFor(item)}</output>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() => {
+                    setNotice(`Reproduzindo o aviso de início da ${item.label.toLowerCase()}...`);
+                    void speakBreakNotice(item).then((result) => setNotice(result.played
+                      ? `Aviso de início da ${item.label.toLowerCase()} reproduzido${result.fallback ? " com a voz disponível no navegador" : " com sucesso"}.`
+                      : `Áudio indisponível: ${result.error}`));
+                  }}
+                >Ouvir aviso de início</button>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() => {
+                    setNotice(`Reproduzindo o aviso de encerramento da ${item.label.toLowerCase()}...`);
+                    void speakBreakNotice(item, "ending").then((result) => setNotice(result.played
+                      ? `Aviso de encerramento da ${item.label.toLowerCase()} reproduzido${result.fallback ? " com a voz disponível no navegador" : " com sucesso"}.`
+                      : `Áudio indisponível: ${result.error}`));
+                  }}
+                >Ouvir aviso de encerramento</button>
+              </div>
+            ))}
+          </div>
+          <div className="modal-actions">
+            <button className="primary-button" type="submit">Salvar pausas e ativar avisos</button>
+          </div>
+        </form>
+      </section>
+    </div>
+  );
+}
+
 export default function Dashboard({
   authUser,
   accessToken,
+  onSignOut: externalSignOut,
 }: {
   authUser: { displayName: string; email: string };
   accessToken: string;
+  onSignOut?: () => Promise<void>;
 }) {
   const [data, setData] = useState<DashboardData>(EMPTY_DATA);
   const [loading, setLoading] = useState(true);
@@ -123,6 +420,10 @@ export default function Dashboard({
   const [menuOpen, setMenuOpen] = useState(false);
   const [search, setSearch] = useState("");
   const onSignOut = async () => {
+    if (externalSignOut) {
+      await externalSignOut();
+      return;
+    }
     window.location.assign("/api/auth/logout");
   };
 
@@ -156,13 +457,16 @@ export default function Dashboard({
         { id: "records", label: "Protocolos e ligações", icon: "▤" },
         { id: "report", label: "Relatórios da equipe", icon: "▥" },
         { id: "team", label: "Equipe", icon: "◎" },
+        { id: "profile", label: "Perfil", icon: "◉" },
       ]
     : [
         { id: "overview", label: "Visão geral", icon: "⌂" },
         { id: "calculator", label: "Calculadora", icon: "▦" },
         { id: "records", label: "Meus registros", icon: "▤" },
-        { id: "scripts", label: "Scripts", icon: "✎" },
+        { id: "scripts", label: "Scripts Inteligentes", icon: "✎" },
+        { id: "breaks", label: "Minhas pausas", icon: "◷" },
         { id: "report", label: "Meu relatório", icon: "▥" },
+        { id: "profile", label: "Perfil", icon: "◉" },
       ];
 
   const today = todayInput();
@@ -237,7 +541,7 @@ export default function Dashboard({
           </div>
           <div className="topbar-user">
             <span className="today-label">{new Date().toLocaleDateString("pt-BR", { day: "2-digit", month: "long", year: "numeric" })}</span>
-            <div className="avatar" aria-hidden="true">{(data.currentUser.name || authUser.displayName).charAt(0).toUpperCase()}</div>
+            <button type="button" className="avatar avatar-button" aria-label="Abrir meu perfil" onClick={() => selectTab("profile")}>{data.currentUser.profilePhoto ? <Image src={data.currentUser.profilePhoto} alt="" width={42} height={42} unoptimized /> : (data.currentUser.name || authUser.displayName).charAt(0).toUpperCase()}</button>
             <button type="button" className="signout signout-button" onClick={() => void onSignOut()}>Sair</button>
           </div>
         </header>
@@ -261,6 +565,12 @@ export default function Dashboard({
               )}
               {tab === "calculator" && !isSupervisor && <Calculator data={data} />}
               {tab === "scripts" && !isSupervisor && <Scripts />}
+              {!isSupervisor && (
+                <BreakSchedule
+                  visible={tab === "breaks"}
+                  userEmail={data.currentUser.email || authUser.email}
+                />
+              )}
               {tab === "records" && (
                 <Records
                   activities={data.activities}
@@ -275,6 +585,7 @@ export default function Dashboard({
               {tab === "report" && (
                 <ProductionReports data={data} isSupervisor={isSupervisor} />
               )}
+              {tab === "profile" && <Profile data={data} accessToken={accessToken} onUpdated={loadDashboard} />}
               {tab === "team" && isSupervisor && <div className="page-stack"><Team data={data} />{data.currentUser.isAdmin ? <Attendants typologies={data.typologies} onChanged={loadDashboard} /> : null}</div>}
             </>
           ) : null}
@@ -349,6 +660,114 @@ function AccountRegistration({
   );
 }
 
+function compressProfilePhoto(file: File) {
+  return new Promise<string>((resolve, reject) => {
+    if (!file.type.startsWith("image/") || file.size > 8 * 1024 * 1024) {
+      reject(new Error("Escolha uma imagem de até 8 MB."));
+      return;
+    }
+    const source = URL.createObjectURL(file);
+    const image = new window.Image();
+    image.onload = () => {
+      URL.revokeObjectURL(source);
+      const size = 256;
+      const scale = Math.max(size / image.width, size / image.height);
+      const width = image.width * scale;
+      const height = image.height * scale;
+      const canvas = document.createElement("canvas");
+      canvas.width = size;
+      canvas.height = size;
+      const context = canvas.getContext("2d");
+      if (!context) {
+        reject(new Error("Não foi possível preparar esta foto."));
+        return;
+      }
+      context.drawImage(image, (size - width) / 2, (size - height) / 2, width, height);
+      const compressed = canvas.toDataURL("image/jpeg", 0.78);
+      if (compressed.length > 300_000) {
+        reject(new Error("Esta foto ficou grande demais. Escolha outra imagem."));
+        return;
+      }
+      resolve(compressed);
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(source);
+      reject(new Error("Não foi possível abrir esta imagem."));
+    };
+    image.src = source;
+  });
+}
+
+function Profile({ data, accessToken, onUpdated }: { data: DashboardData; accessToken: string; onUpdated: () => Promise<void> }) {
+  const [name, setName] = useState(data.currentUser.name);
+  const [profilePhoto, setProfilePhoto] = useState(data.currentUser.profilePhoto);
+  const [message, setMessage] = useState("");
+  const [messageType, setMessageType] = useState<"error" | "success" | "">("");
+  const [saving, setSaving] = useState(false);
+  const initials = (name || data.currentUser.email).trim().charAt(0).toUpperCase();
+
+  async function choosePhoto(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    try {
+      setProfilePhoto(await compressProfilePhoto(file));
+      setMessage("");
+      setMessageType("");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Não foi possível carregar a foto.");
+      setMessageType("error");
+    }
+  }
+
+  async function saveProfile(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setSaving(true);
+    setMessage("");
+    setMessageType("");
+    try {
+      const response = await fetch("/api/profile", {
+        method: "PUT",
+        headers: { "content-type": "application/json", authorization: `Bearer ${accessToken}` },
+        body: JSON.stringify({ name, profilePhoto }),
+      });
+      const result = await response.json() as { error?: string };
+      if (!response.ok) throw new Error(result.error || "Não foi possível salvar o perfil.");
+      await onUpdated();
+      setMessage("Perfil atualizado com sucesso.");
+      setMessageType("success");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Não foi possível salvar o perfil.");
+      setMessageType("error");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return <div className="page-stack">
+    <div className="page-title"><div><p className="eyebrow">MINHA CONTA</p><h2>Perfil</h2><p>Atualize sua foto e confira seus dados de acesso.</p></div></div>
+    <section className="panel profile-panel">
+      <div className="profile-photo-column">
+        <div className="profile-photo-preview">{profilePhoto ? <Image src={profilePhoto} alt={`Foto de perfil de ${name}`} width={176} height={176} unoptimized /> : <span>{initials}</span>}</div>
+        <label className="secondary-button profile-photo-button">Escolher foto<input type="file" accept="image/jpeg,image/png,image/webp" onChange={(event) => void choosePhoto(event)} /></label>
+        {profilePhoto ? <button type="button" className="profile-remove-photo" onClick={() => setProfilePhoto(null)}>Remover foto</button> : null}
+        <small>JPG, PNG ou WebP. A foto é reduzida para caber no perfil.</small>
+      </div>
+      <form className="profile-form" onSubmit={saveProfile}>
+        <div><p className="eyebrow">DADOS DO PERFIL</p><h3>Informações da conta</h3><p>Seu e-mail e seu tipo de acesso são administrados pelo sistema.</p></div>
+        <label className="field"><span>Nome de exibição</span><input value={name} onChange={(event) => setName(event.target.value)} minLength={3} maxLength={120} required /></label>
+        <div className="profile-info-grid">
+          <label className="field"><span>E-mail de acesso</span><input value={data.currentUser.email} readOnly /></label>
+          <label className="field"><span>Tipo de acesso</span><input value={data.currentUser.role === "supervisor" ? "Supervisão" : "Atendente"} readOnly /></label>
+          <label className="field"><span>Matrícula ou identificação</span><input value={data.currentUser.employeeCode || "Não informada"} readOnly /></label>
+        </div>
+        <button className="primary-button profile-save-button" type="submit" disabled={saving}>{saving ? "Salvando perfil…" : "Salvar alterações"}</button>
+        {message ? <p className={`form-status ${messageType}`} role={messageType === "error" ? "alert" : "status"}>{message}</p> : null}
+      </form>
+    </section>
+  </div>;
+}
+
 function LoadingState() {
   return (
     <div className="loading-grid" aria-label="Carregando painel">
@@ -377,24 +796,82 @@ function Overview({
   accessToken: string;
 }) {
   const [overviewEmail, setOverviewEmail] = useState("all");
+  const [productionMonth, setProductionMonth] = useState(monthInput);
+  const [selectedProductionDay, setSelectedProductionDay] = useState(todayInput);
+  const [monthlyTeam, setMonthlyTeam] = useState<MonthlyTeamMember[]>([]);
+  const [dailyProductionRows, setDailyProductionRows] = useState<AttendantDayProduction[]>([]);
+  const [monthlyActivities, setMonthlyActivities] = useState<Activity[]>([]);
+  const [monthlyLoading, setMonthlyLoading] = useState(false);
+  const [monthlyError, setMonthlyError] = useState("");
+  const [monthlyReload, setMonthlyReload] = useState(0);
+
+  useEffect(() => {
+    if (!isSupervisor || !accessToken) return;
+    const controller = new AbortController();
+    const params = new URLSearchParams({ month: productionMonth });
+    if (overviewEmail !== "all") params.set("email", overviewEmail);
+    void Promise.resolve().then(() => {
+      setMonthlyLoading(true);
+      setMonthlyError("");
+      setMonthlyTeam([]);
+      setDailyProductionRows([]);
+      setMonthlyActivities([]);
+      return fetch(`/api/supervisor/monthly-production?${params}`, {
+        cache: "no-store",
+        headers: { authorization: `Bearer ${accessToken}` },
+        signal: controller.signal,
+      });
+    }).then(async (response) => {
+      const result = await response.json() as {
+        month?: string;
+        team?: MonthlyTeamMember[];
+        dailyProduction?: AttendantDayProduction[];
+        recentActivities?: Activity[];
+        error?: string;
+      };
+      if (!response.ok) throw new Error(result.error || "Não foi possível carregar a produção mensal.");
+      setMonthlyTeam(result.team ?? []);
+      setDailyProductionRows(result.dailyProduction ?? []);
+      setMonthlyActivities(result.recentActivities ?? []);
+    }).catch((loadError: unknown) => {
+      if (controller.signal.aborted) return;
+      setMonthlyError(loadError instanceof Error ? loadError.message : "Não foi possível carregar a produção mensal.");
+      setMonthlyTeam([]);
+      setDailyProductionRows([]);
+      setMonthlyActivities([]);
+    }).finally(() => {
+      if (!controller.signal.aborted) setMonthlyLoading(false);
+    });
+    return () => controller.abort();
+  }, [isSupervisor, accessToken, productionMonth, overviewEmail, monthlyReload]);
+
   const selectedOverviewMember = data.team.find((member) => member.email === overviewEmail);
-  const overviewActivities = overviewEmail === "all"
-    ? data.activities
-    : data.activities.filter((activity) => activity.userEmail === overviewEmail);
-  const overviewTeam = selectedOverviewMember ? [selectedOverviewMember] : data.team;
-  const overviewData = { ...data, activities: overviewActivities, team: overviewTeam };
-  const teamProductivity = data.team.length
-    ? data.team.reduce((sum, member) => sum + attendantAverageProductivity(data, member.email), 0) / data.team.length
-    : 0;
-  const selectedProductivity = selectedOverviewMember
-    ? attendantAverageProductivity(data, selectedOverviewMember.email)
-    : teamProductivity;
+  const overviewActivities = isSupervisor
+    ? monthlyActivities
+    : overviewEmail === "all"
+      ? data.activities
+      : data.activities.filter((activity) => activity.userEmail === overviewEmail);
+  const visibleMonthlyTeam = overviewEmail === "all"
+    ? monthlyTeam
+    : monthlyTeam.filter((member) => member.email === overviewEmail);
+  const selectedDayProduction = summarizeSelectedDay(
+    dailyProductionRows,
+    selectedProductionDay,
+    data.settings.workdaySeconds,
+  );
+  const selectedDayLabel = selectedProductionDay
+    ? new Date(`${selectedProductionDay}T12:00:00`).toLocaleDateString("pt-BR", { weekday: "long", day: "2-digit", month: "long", year: "numeric" })
+    : "dia selecionado";
+  const monthLabel = productionMonth
+    ? new Date(`${productionMonth}-01T12:00:00`).toLocaleDateString("pt-BR", { month: "long", year: "numeric" })
+    : "mês selecionado";
+  const selectedDayMetrics = dailyProductionMetrics(selectedDayProduction.attendants);
   const cards = isSupervisor
     ? [
-        { label: selectedOverviewMember?.name ?? "Atendentes", value: selectedOverviewMember ? "1" : String(data.team.length), icon: "◎", tone: "blue" },
-        { label: "Protocolos registrados", value: String(overviewActivities.filter((a) => a.kind === "protocol").reduce((s, a) => s + a.quantity, 0)), icon: "▤", tone: "blue" },
-        { label: "Ligações registradas", value: String(overviewActivities.filter((a) => a.kind === "call").reduce((s, a) => s + a.quantity, 0)), icon: "◖", tone: "green" },
-        { label: selectedOverviewMember ? "Produtividade média do atendente" : "Média de produtividade da equipe", value: formatPercent(selectedProductivity), icon: "↗", tone: "green" },
+        { label: "Atendentes com produção no dia", value: monthlyLoading ? "…" : String(selectedDayMetrics.producingAttendants), icon: "◎", tone: "blue" },
+        { label: "Protocolos no dia", value: monthlyLoading ? "…" : String(selectedDayMetrics.protocols), icon: "▤", tone: "blue" },
+        { label: "Ligações no dia", value: monthlyLoading ? "…" : String(selectedDayMetrics.calls), icon: "◖", tone: "green" },
+        { label: "Atividades no dia", value: monthlyLoading ? "…" : String(selectedDayMetrics.total), icon: "◷", tone: "green" },
       ]
     : [
         { label: "Produtividade hoje", value: formatPercent(productivity), icon: "↗", tone: "green" },
@@ -405,8 +882,10 @@ function Overview({
 
   return (
     <div className="page-stack">
-      {isSupervisor ? <section className="panel overview-scope-filter"><div><p className="eyebrow">VISÃO DA PRODUTIVIDADE</p><h2>{selectedOverviewMember ? selectedOverviewMember.name : "Equipe geral"}</h2><p>Escolha a equipe completa ou um atendente para atualizar todos os indicadores desta tela.</p></div><label><span>Visualizar</span><select value={overviewEmail} onChange={(event) => setOverviewEmail(event.target.value)}><option value="all">Equipe geral</option>{data.team.map((member) => <option key={member.email} value={member.email}>{member.name}</option>)}</select></label></section> : null}
-      <section className="metric-grid">
+      {isSupervisor ? <section className="panel overview-scope-filter"><div><p className="eyebrow">PRODUÇÃO DA SUPERVISÃO</p><h2>Consulte por data</h2><p>Escolha um dia para ver a produção e a produtividade registradas.</p></div><label><span>Escolher dia</span><input type="date" value={selectedProductionDay} onChange={(event) => { const date = event.target.value || todayInput(); setSelectedProductionDay(date); setProductionMonth(date.slice(0, 7)); }} /></label></section> : null}
+      {isSupervisor && monthlyError ? <div className="alert error" role="alert">{monthlyError}<button type="button" onClick={() => setMonthlyReload((count) => count + 1)}>Tentar novamente</button></div> : null}
+      {isSupervisor ? <section className="panel selected-day-panel"><div className="selected-day-heading"><div><p className="eyebrow">PRODUÇÃO DE {selectedDayLabel}</p><p>{overviewEmail === "all" ? "Média da equipe e produção por atendente" : `Resultado individual: ${selectedOverviewMember?.name ?? "Atendente"}`}</p></div><div className="selected-day-average"><small>Média de produtividade</small>{selectedDayProduction.attendants.length ? <strong className={productivityBand(selectedDayProduction.average)}>{formatPercent(selectedDayProduction.average)}</strong> : <strong>{monthlyLoading ? "Carregando…" : "Sem produção registrada"}</strong>}</div></div><label className="daily-attendant-filter"><span>Atendente</span><select value={overviewEmail} onChange={(event) => setOverviewEmail(event.target.value)}><option value="all">Equipe geral</option>{data.team.map((member) => <option key={member.email} value={member.email}>{member.name}</option>)}</select></label>{monthlyLoading ? <p className="no-daily-production" role="status">Carregando a produção da data selecionada…</p> : selectedDayProduction.attendants.length ? <div className="table-scroll"><table><thead><tr><th>Atendente</th><th>Protocolos</th><th>Ligações</th><th>Total do dia</th><th>Tempo produtivo</th><th>Produtividade</th></tr></thead><tbody>{selectedDayProduction.attendants.map((attendant) => <tr key={attendant.email}><td><strong>{attendant.name}</strong></td><td>{attendant.protocols}</td><td>{attendant.calls}</td><td>{attendant.total}</td><td>{formatDuration(attendant.productiveSeconds)}</td><td><span className={`score-pill ${productivityBand(attendant.productivity)}`}>{formatPercent(attendant.productivity)}</span></td></tr>)}</tbody></table></div> : <p className="no-daily-production">Não há registros de produção para esta data e este filtro.</p>}</section> : null}
+      <section className={`metric-grid${isSupervisor ? " supervisor-metric-grid" : ""}`}>
         {cards.map((card) => (
           <article className="metric-card" key={card.label}>
             <span className={`metric-icon ${card.tone}`}>{card.icon}</span>
@@ -417,7 +896,7 @@ function Overview({
 
       {isSupervisor ? (
         <div className="dashboard-grid supervisor-grid">
-          <TeamSummary data={overviewData} compact />
+          <MonthlyTeamSummary team={visibleMonthlyTeam} monthLabel={monthLabel} loading={monthlyLoading} workdaySeconds={data.settings.workdaySeconds} />
           <RecentActivities activities={overviewActivities} supervisor />
         </div>
       ) : (
@@ -674,7 +1153,7 @@ function Attendants({ typologies, onChanged }: { typologies: Typology[]; onChang
   }, []);
 
   useEffect(() => {
-    void loadAttendants().catch((error) => setStatus({ type: "error", message: error instanceof Error ? error.message : "Erro ao carregar." }));
+    void Promise.resolve().then(loadAttendants).catch((error) => setStatus({ type: "error", message: error instanceof Error ? error.message : "Erro ao carregar." }));
   }, [loadAttendants]);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -749,6 +1228,7 @@ function Attendants({ typologies, onChanged }: { typologies: Typology[]; onChang
   return (
     <div className="page-stack attendants-page">
       <div className="page-title"><div><p className="eyebrow">ADMINISTRAÇÃO DE ACESSOS</p><h2>Cadastro de atendentes</h2><p>Crie até {limit} acessos individuais. Somente e-mails Microsoft corporativos da Equatorial Serviços.</p></div><span className="permission-tag">{attendants.length}/{limit} cadastrados</span></div>
+      <DemoAccessCard />
       <section className="attendants-layout">
         <form className="panel attendants-form activity-form" onSubmit={submit}>
           <div className="section-heading"><div><p className="eyebrow">NOVO ACESSO</p><h2>Adicionar atendente</h2></div></div>
@@ -799,7 +1279,10 @@ function Scripts() {
   const [siteProtocol, setSiteProtocol] = useState("");
   const [previousProtocol, setPreviousProtocol] = useState("");
   const [denialReason, setDenialReason] = useState("");
+  const [selectedDenialReason, setSelectedDenialReason] = useState("");
   const [accountContract, setAccountContract] = useState("");
+  const [consumptionLocation, setConsumptionLocation] = useState("");
+  const [businessPartner, setBusinessPartner] = useState("");
   const [contactPhone, setContactPhone] = useState("");
   const [documents, setDocuments] = useState("RG, CPF, DOCUMENTO DE POSSE");
   const [returnEmail, setReturnEmail] = useState("");
@@ -809,12 +1292,13 @@ function Scripts() {
   const siteName = siteCustomerName.trim().toUpperCase() || "NOME COMPLETO DO CLIENTE";
   const sapName = sapCustomerName.trim().toUpperCase() || "NOME COMPLETO DO CLIENTE";
   const protocol = sapProtocol.trim() || "NÚMERO DO PROTOCOLO SAP";
+  const denialReasonText = selectedDenialReason ? formatDenialReason(selectedDenialReason, accountContract) : denialReason;
   const footer = `Estamos à disposição para lhe atender: www.equatorialenergia.com.br, WhatsApp ${contact.whatsapp} e Central de Atendimento ${contact.central}.\n\nConte sempre com a nossa Energia!\n\nEquatorial Energia`;
 
   const scripts: Record<ScriptKind, string> = {
     immediate: `Olá, ${siteName}!\n\nRecebemos a sua solicitação de Troca de Titularidade e já registramos em nosso sistema. Sua nova conta contrato ${newContract.trim() || "NOVA CONTA CONTRATO"} marca o início da sua jornada como cliente da Equatorial. O número do seu protocolo de atendimento é ${protocol}.\n\n${footer}`,
     analysis: `Olá, ${siteName}!\n\nRecebemos a sua solicitação de Troca de Titularidade e já encaminhamos para análise. Se estiver tudo certo, o serviço será realizado em até 3 (três) dias úteis para área urbana ou 5 (cinco) dias úteis para área rural. Orientamos acompanhar o andamento pela Central de Atendimento, site ou agência mais próxima. O número do seu protocolo de atendimento é ${protocol}.\n\n${footer}`,
-    denied: `Olá, ${siteName}!\n\nRecebemos a sua solicitação de Troca de Titularidade, porém ainda não foi possível realizar o atendimento pelo seguinte motivo: ${denialReason.trim().toUpperCase() || "INFORME O MOTIVO DO INDEFERIMENTO"}. Solicite um novo serviço assim que o motivo indicado estiver resolvido. Aguardamos seu retorno!\n\nO número do seu protocolo de atendimento é ${protocol}.\n\n${footer}`,
+    denied: `Olá, ${siteName}!\n\nRecebemos a sua solicitação de Troca de Titularidade, porém ainda não foi possível realizar o atendimento pelo seguinte motivo: ${denialReasonText.trim().toUpperCase() || "INFORME O MOTIVO DO INDEFERIMENTO"}. Solicite um novo serviço assim que o motivo indicado estiver resolvido. Aguardamos seu retorno!\n\nO número do seu protocolo de atendimento é ${protocol}.\n\n${footer}`,
     reactivation: `Olá, ${siteName}!\n\nRecebemos a sua solicitação de Troca de Titularidade e já encaminhamos para análise. Se estiver tudo certo, o serviço será realizado em até 3 (três) dias úteis para área urbana ou 5 (cinco) dias úteis para área rural, e a reativação será realizada em até 5 dias úteis. Orientamos acompanhar o andamento pela Central de Atendimento, site ou agência mais próxima. O número do seu protocolo de atendimento é ${protocol}.\n\n${footer}`,
     repeat: `Olá, ${siteName}!\n\nA sua solicitação de Troca de Titularidade, registrada pelo protocolo do site ${siteProtocol.trim() || "PROTOCOLO DO SITE"}, não foi registrada porque identificamos que já consta uma solicitação pelo protocolo ${previousProtocol.trim() || "PROTOCOLO ANTERIOR"}, que se encontra em andamento. Esta solicitação será classificada como reincidente e será necessário aguardar sua conclusão e comunicação.\n\nO número do seu protocolo de atendimento é ${protocol}.\n\n${footer}`,
   };
@@ -825,6 +1309,8 @@ Nº DO PROTOCOLO DO SITE: ${siteProtocol.trim() || "INFORME O PROTOCOLO DO SITE"
 PEDIDO DE TROCA DE TITULARIDADE PARA O CLIENTE: ${sapName}
 
 CC/UC: ${accountContract.trim() || "INFORME A CC/UC"}
+
+${buildSapAdditionalFields(consumptionLocation, businessPartner)}
 
 MOTIVO DA TROCA: XXXXXXXXXXXXXXX
 
@@ -857,11 +1343,15 @@ EM ANEXO DECLARAÇÃO DE TROCA DE TITULARIDADE REVISADA COM AS DOCUMENTAÇÕES A
           <label className="field"><span>Nome do cliente - script do site</span><input value={siteCustomerName} onChange={(event) => setSiteCustomerName(event.target.value)} placeholder="Ex.: Antônio dos Santos Sousa" /></label>
           <label className="field"><span>Protocolo do SAP</span><input value={sapProtocol} onChange={(event) => setSapProtocol(event.target.value)} placeholder="Ex.: 65986619" /></label>
           {kind === "immediate" ? <label className="field"><span>Nova conta contrato</span><input value={newContract} onChange={(event) => setNewContract(event.target.value)} placeholder="Ex.: 3040387519" /></label> : null}
-          {kind === "denied" ? <label className="field"><span>Motivo do indeferimento</span><textarea value={denialReason} onChange={(event) => setDenialReason(event.target.value)} placeholder="Ex.: Documentação incompleta..." rows={4} /></label> : null}
+          {kind === "denied" ? <>
+            <label className="field"><span>Selecionar motivo do indeferimento</span><select value={selectedDenialReason} onChange={(event) => { setSelectedDenialReason(event.target.value); setDenialReason(""); }}><option value="">Escolha um motivo ou escreva abaixo</option>{DENIAL_REASON_GROUPS.map((group) => <optgroup key={group.id} label={group.label}>{group.reasons.map((reason) => <option key={reason.id} value={reason.id}>{reason.label}</option>)}</optgroup>)}</select><em>Os motivos adicionais estão marcados para validação com o gestor.</em></label>
+            <label className="field"><span>Texto do motivo (editável)</span><textarea value={selectedDenialReason ? formatDenialReason(selectedDenialReason, accountContract) : denialReason} onChange={(event) => { setSelectedDenialReason(""); setDenialReason(event.target.value); }} placeholder="Selecione um motivo ou escreva o texto do indeferimento..." rows={4} /></label>
+          </> : null}
           {kind === "repeat" ? <div className="form-row script-two-columns"><label className="field"><span>Protocolo do site</span><input value={siteProtocol} onChange={(event) => setSiteProtocol(event.target.value)} /></label><label className="field"><span>Protocolo anterior em andamento</span><input value={previousProtocol} onChange={(event) => setPreviousProtocol(event.target.value)} /></label></div> : null}
           <div className="section-heading script-sap-heading"><div><p className="eyebrow">TEXTO PARA O SAP</p><h2>Solicitação via Backoffice</h2></div></div>
           {kind !== "repeat" ? <label className="field"><span>Protocolo do site</span><input value={siteProtocol} onChange={(event) => setSiteProtocol(event.target.value)} placeholder="Ex.: 20260805000579351" /></label> : null}
           <div className="form-row script-two-columns"><label className="field"><span>Nome do cliente - texto do SAP</span><input value={sapCustomerName} onChange={(event) => setSapCustomerName(event.target.value)} placeholder="Ex.: Antônio dos Santos Sousa" /></label><label className="field"><span>CC/UC</span><input value={accountContract} onChange={(event) => setAccountContract(event.target.value)} /></label></div>
+          <div className="form-row script-two-columns"><label className="field"><span>Local de Consumo</span><input value={consumptionLocation} onChange={(event) => setConsumptionLocation(event.target.value)} placeholder="Informe o local de consumo" /></label><label className="field"><span>Parceiro de Negócio</span><input value={businessPartner} onChange={(event) => setBusinessPartner(event.target.value)} placeholder="Informe o parceiro de negócio" /></label></div>
           <label className="field"><span>Telefone de contato</span><input type="tel" value={contactPhone} onChange={(event) => setContactPhone(event.target.value)} placeholder="Ex.: (91) 99999-9999" /></label>
           <label className="field"><span>Documentos apresentados</span><input value={documents} onChange={(event) => setDocuments(event.target.value)} /></label>
           <div className="form-row script-two-columns"><label className="field"><span>E-mail para retorno</span><input type="email" value={returnEmail} onChange={(event) => setReturnEmail(event.target.value)} /></label><label className="field"><span>Classe de consumo</span><select value={consumptionClass} onChange={(event) => setConsumptionClass(event.target.value)}><option value="RESIDENCIAL">Residencial</option><option value="EMPRESA">Empresa</option></select></label></div>
@@ -876,31 +1366,6 @@ EM ANEXO DECLARAÇÃO DE TROCA DE TITULARIDADE REVISADA COM AS DOCUMENTAÇÕES A
           <button className="primary-button copy-script-button" type="button" onClick={() => void copyScript(sapRequest, "sap")}>{copied === "sap" ? "Texto do SAP copiado!" : "Copiar texto para o SAP"}</button>
         </aside>
       </section>
-    </div>
-  );
-}
-
-function Report({ data, isSupervisor }: { data: DashboardData; isSupervisor: boolean }) {
-  const [selectedEmail, setSelectedEmail] = useState("all");
-  const source = isSupervisor && selectedEmail !== "all" ? data.activities.filter((activity) => activity.userEmail === selectedEmail) : data.activities;
-  const groups = data.typologies.map((typology) => {
-    const items = source.filter((activity) => activity.typologyId === typology.id);
-    return { name: typology.name, total: items.reduce((sum, item) => sum + item.quantity, 0) };
-  }).filter((item) => item.total > 0).sort((a, b) => b.total - a.total);
-  const max = Math.max(1, ...groups.map((item) => item.total));
-  const protocolCount = source.filter((item) => item.kind === "protocol").reduce((sum, item) => sum + item.quantity, 0);
-  const callCount = source.filter((item) => item.kind === "call").reduce((sum, item) => sum + item.quantity, 0);
-  const selectedMember = data.team.find((member) => member.email === selectedEmail);
-  const exportOptions = {
-    title: isSupervisor ? "Relatório de produtividade da equipe" : "Relatório individual de produtividade",
-    subtitle: isSupervisor ? (selectedMember?.name ?? "Toda a equipe") : data.currentUser.name,
-    activities: source,
-  };
-  return (
-    <div className="page-stack">
-      <div className="page-title report-title"><div><p className="eyebrow">ANÁLISE</p><h2>{isSupervisor ? "Relatórios da equipe" : "Meu relatório"}</h2><p>{isSupervisor ? "Selecione toda a equipe ou um atendente para consultar e exportar." : "Resumo individual dos seus registros realizados no sistema."}</p></div>{isSupervisor ? <div className="report-toolbar"><select value={selectedEmail} onChange={(event) => setSelectedEmail(event.target.value)}><option value="all">Toda a equipe</option>{data.team.map((member) => <option key={member.email} value={member.email}>{member.name}</option>)}</select><div className="export-actions"><button type="button" className="export-button pdf" onClick={() => exportPdfReport(exportOptions)}>Baixar PDF</button><button type="button" className="export-button excel" onClick={() => exportExcelReport(exportOptions)}>Baixar Excel</button></div></div> : <span className="permission-tag readonly">Visualização individual</span>}</div>
-      <section className="metric-grid report-metrics"><article className="metric-card"><span className="metric-icon blue">▤</span><div><small>Protocolos</small><strong>{protocolCount}</strong></div></article><article className="metric-card"><span className="metric-icon green">◖</span><div><small>Ligações</small><strong>{callCount}</strong></div></article><article className="metric-card"><span className="metric-icon blue">Σ</span><div><small>Total</small><strong>{protocolCount + callCount}</strong></div></article></section>
-      <section className="panel chart-panel"><div className="section-heading"><div><p className="eyebrow">DISTRIBUIÇÃO</p><h2>Quantidade por tipologia</h2></div></div>{groups.length ? <div className="bar-chart">{groups.map((item) => <div className="bar-row" key={item.name}><div><span>{item.name}</span><strong>{item.total}</strong></div><div className="bar-track"><span style={{ width: `${(item.total / max) * 100}%` }} /></div></div>)}</div> : <EmptyState title="Sem dados para o relatório" text="Os indicadores serão exibidos após os primeiros registros." />}</section>
     </div>
   );
 }
@@ -928,21 +1393,29 @@ function reportRange(period: ReportPeriod, reference: string) {
 }
 
 function ProductionReports({ data, isSupervisor }: { data: DashboardData; isSupervisor: boolean }) {
-  const [selectedEmail, setSelectedEmail] = useState("all");
+  const [selectedEmails, setSelectedEmails] = useState<string[]>([]);
   const [period, setPeriod] = useState<ReportPeriod | "">("");
   const [referenceDate, setReferenceDate] = useState(todayInput());
   const [startDate, setStartDate] = useState(todayInput());
   const [endDate, setEndDate] = useState(todayInput());
+  const reportTeam = (isSupervisor ? data.team : [{ name: data.currentUser.name, email: data.currentUser.email }])
+    .filter((member) => !isDemoReportAccount(member.email, member.name));
+  const reportSelection = filterReportSelection(
+    reportTeam,
+    data.activities,
+    isSupervisor ? selectedEmails : [],
+  );
+  const selectedMembers = reportSelection.attendants;
+  const isWholeTeamSelected = !selectedEmails.length || selectedMembers.length === reportTeam.length;
+  const personLabel = isSupervisor
+    ? isWholeTeamSelected ? "Toda a equipe" : selectedMembers.length === 1 ? selectedMembers[0].name : `${selectedMembers.length} atendentes selecionados`
+    : data.currentUser.name;
   const periods: { id: ReportPeriod; label: string; description: string }[] = [
     { id: "daily", label: "Diário", description: "Produção do dia selecionado" },
     { id: "weekly", label: "Semanal", description: "De segunda-feira a domingo" },
     { id: "monthly", label: "Mensal", description: "Produção do mês selecionado" },
   ];
-  const selectedMember = data.team.find((member) => member.email === selectedEmail);
-  const personLabel = isSupervisor ? (selectedMember?.name ?? "Toda a equipe") : data.currentUser.name;
-  const baseSource = (isSupervisor && selectedEmail !== "all"
-    ? data.activities.filter((activity) => activity.userEmail === selectedEmail)
-    : data.activities).filter((activity) => activity.kind === "protocol");
+  const baseSource = reportSelection.activities.filter((activity) => activity.kind === "protocol");
   const rangeFor = (nextPeriod: ReportPeriod) => nextPeriod === "custom"
     ? { start: startDate <= endDate ? startDate : endDate, end: startDate <= endDate ? endDate : startDate }
     : reportRange(nextPeriod, referenceDate);
@@ -982,12 +1455,15 @@ function ProductionReports({ data, isSupervisor }: { data: DashboardData; isSupe
     const exportDates = exportRange.start === exportRange.end
       ? new Date(`${exportRange.start}T12:00:00`).toLocaleDateString("pt-BR")
       : `${new Date(`${exportRange.start}T12:00:00`).toLocaleDateString("pt-BR")} a ${new Date(`${exportRange.end}T12:00:00`).toLocaleDateString("pt-BR")}`;
-    return { title: `Relatório ${label.toLowerCase()} de protocolos`, subtitle: `${personLabel} • Período: ${exportDates}`, activities: filterPeriod(nextPeriod).filter((activity) => activity.kind === "protocol") };
+    return { title: `Relatório ${label.toLowerCase()} de protocolos`, subtitle: `${personLabel} • Período: ${exportDates}`, activities: filterPeriod(nextPeriod).filter((activity) => activity.kind === "protocol"), attendants: selectedMembers };
   };
+  const toggleAttendant = (email: string) => setSelectedEmails((current) => current.includes(email)
+    ? current.filter((selected) => selected !== email)
+    : [...current, email]);
   return <div className="page-stack">
-    <div className="page-title report-title"><div><p className="eyebrow">ANÁLISE DE PRODUÇÃO</p><h2>{isSupervisor ? "Relatórios por atendente" : "Meu relatório"}</h2><p>{isSupervisor ? "Consulte e exporte a produção diária, semanal e mensal de cada atendente." : "Consulte e exporte sua produção por período."}</p></div><span className="permission-tag readonly">Somente leitura</span></div>
+    <div className="page-title report-title"><div><p className="eyebrow">ANÁLISE DE PRODUÇÃO</p><h2>{isSupervisor ? "Relatórios por atendente" : "Meu relatório"}</h2><p>{isSupervisor ? "Combine atendentes no mesmo relatório. No Excel, cada pessoa terá sua própria aba; no PDF, os resultados ficam agrupados por pessoa." : "Consulte e exporte sua produção por período."}</p></div><span className="permission-tag readonly">Somente leitura</span></div>
     <section className="panel report-filters">
-      {isSupervisor ? <label><span>Atendente</span><select value={selectedEmail} onChange={(event) => setSelectedEmail(event.target.value)}><option value="all">Toda a equipe</option>{data.team.map((member) => <option key={member.email} value={member.email}>{member.name}</option>)}</select></label> : null}
+      {isSupervisor ? <fieldset className="report-attendant-picker"><legend>Atendentes incluídos</legend><details className="report-attendant-dropdown"><summary className="report-attendant-trigger"><span>{personLabel}</span></summary><div className="report-attendant-menu"><label className={`report-attendant-option ${isWholeTeamSelected ? "selected" : ""}`}><input type="checkbox" checked={isWholeTeamSelected} onChange={() => setSelectedEmails([])} /><span>Toda a equipe</span></label>{reportTeam.map((member) => { const checked = selectedEmails.includes(member.email); return <label className={`report-attendant-option ${checked ? "selected" : ""}`} key={member.email}><input type="checkbox" checked={checked} onChange={() => toggleAttendant(member.email)} /><span>{member.name}</span></label>; })}</div></details><small>Selecione um ou vários atendentes. Sem seleção, o relatório inclui toda a equipe.</small></fieldset> : null}
       <label><span>Período exibido</span><select value={period} onChange={(event) => setPeriod(event.target.value as ReportPeriod | "")}><option value="">Escolha Diário, Semanal ou Mensal</option>{periods.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}<option value="custom">Personalizado</option></select></label>
       {period === "custom" ? <span className="permission-tag">Período personalizado</span> : null}
       <label className="report-date-range"><span>Data inicial</span><input type="date" value={startDate} onClick={(event) => event.currentTarget.showPicker?.()} onChange={(event) => { setStartDate(event.target.value); setReferenceDate(event.target.value); setPeriod("custom"); }} /><small>Clique no campo para abrir o calendário.</small></label>
@@ -1010,11 +1486,25 @@ function Team({ data }: { data: DashboardData }) {
   return <div className="page-stack"><div className="page-title"><div><p className="eyebrow">ACESSO DA SUPERVISÃO</p><h2>Desempenho da equipe</h2><p>Somente visualização: nenhum registro pode ser criado ou alterado aqui.</p></div></div><TeamSummary data={data} /></div>;
 }
 
+function MonthlyTeamSummary({ team, monthLabel, loading, workdaySeconds }: { team: MonthlyTeamMember[]; monthLabel: string; loading: boolean; workdaySeconds: number }) {
+  return (
+    <section className="panel team-panel monthly-team-panel">
+      <div className="section-heading"><div><p className="eyebrow">PRODUÇÃO DO MÊS</p><h2>Resultado por atendente</h2><p>Período: {monthLabel}</p></div><span className="permission-tag readonly">Somente leitura</span></div>
+      {loading ? <p className="monthly-loading" role="status">Carregando produção mensal...</p>
+        : team.length ? <div className="table-scroll"><table><thead><tr><th>Atendente</th><th>Protocolos</th><th>Ligações</th><th>Total</th><th>Tempo produtivo</th><th>Dias ativos</th><th>Produtividade média do mês</th></tr></thead><tbody>{team.map((member) => {
+          const score = member.activeDays ? member.productiveSeconds / (workdaySeconds * member.activeDays) : 0;
+          return <tr key={member.email}><td><strong>{member.name}</strong><small>{member.email}</small></td><td>{member.protocols}</td><td>{member.calls}</td><td><strong>{member.total}</strong></td><td>{formatDuration(member.productiveSeconds)}</td><td>{member.activeDays}</td><td>{member.activeDays ? <span className={`score-pill ${productivityBand(score)}`}>{formatPercent(score)}</span> : "—"}</td></tr>;
+        })}</tbody></table></div>
+          : <EmptyState title="Nenhum atendente identificado" text={`Os atendentes aparecerão aqui quando houver produção em ${monthLabel}.`} />}
+    </section>
+  );
+}
+
 function TeamSummary({ data, compact = false }: { data: DashboardData; compact?: boolean }) {
   return (
     <section className={`panel team-panel ${compact ? "compact" : ""}`}>
       <div className="section-heading"><div><p className="eyebrow">EQUIPE</p><h2>Resultado por atendente</h2></div><span className="permission-tag readonly">Somente leitura</span></div>
-      {data.team.length ? <div className="table-scroll"><table><thead><tr><th>Atendente</th><th>Protocolos</th><th>Ligações</th><th>Produtividade média</th></tr></thead><tbody>{data.team.map((member) => { const score = attendantAverageProductivity(data, member.email); return <tr key={member.email}><td><strong>{member.name}</strong><small>{member.email}</small></td><td>{member.protocols}</td><td>{member.calls}</td><td><span className={`score-pill ${score >= 0.9 ? "good" : "low"}`}>{formatPercent(score)}</span></td></tr>; })}</tbody></table></div> : <EmptyState title="Nenhum atendente identificado" text="Os atendentes aparecerão depois do primeiro acesso ao sistema." />}
+      {data.team.length ? <div className="table-scroll"><table><thead><tr><th>Atendente</th><th>Protocolos</th><th>Ligações</th><th>Produtividade média</th></tr></thead><tbody>{data.team.map((member) => { const score = teamMemberProductivity(member, data.settings.workdaySeconds); return <tr key={member.email}><td><strong>{member.name}</strong><small>{member.email}</small></td><td>{member.protocols}</td><td>{member.calls}</td><td><span className={`score-pill ${productivityBand(score)}`}>{formatPercent(score)}</span></td></tr>; })}</tbody></table></div> : <EmptyState title="Nenhum atendente identificado" text="Os atendentes aparecerão depois do primeiro acesso ao sistema." />}
     </section>
   );
 }

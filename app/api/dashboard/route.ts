@@ -34,6 +34,7 @@ export async function GET(request: Request) {
           a.distribution_state AS distributionState,
           a.backoffice_url AS backofficeUrl
          FROM activities a LEFT JOIN users u ON u.email = a.user_email
+         WHERE COALESCE(u.is_demo, 0) = 0
          ORDER BY a.occurred_at DESC, a.id DESC LIMIT 5000`
       : `SELECT a.id, a.user_email AS userEmail, COALESCE(u.name, a.user_email) AS userName,
           a.kind, a.protocol, a.outcome, a.typology_id AS typologyId, a.typology_name AS typologyName,
@@ -52,9 +53,10 @@ export async function GET(request: Request) {
           COALESCE(SUM(CASE WHEN a.kind = 'protocol' THEN a.quantity ELSE 0 END), 0) AS protocols,
           COALESCE(SUM(CASE WHEN a.kind = 'call' THEN a.quantity ELSE 0 END), 0) AS calls,
           COALESCE(SUM(a.quantity), 0) AS total,
-          COALESCE(SUM(a.duration_seconds * a.quantity), 0) AS productiveSeconds
+          COALESCE(SUM(a.duration_seconds * a.quantity), 0) AS productiveSeconds,
+          COUNT(DISTINCT CASE WHEN a.id IS NOT NULL THEN substr(a.occurred_at, 1, 10) END) AS activeDays
         FROM users u LEFT JOIN activities a ON a.user_email = u.email
-        WHERE u.role = 'attendant' AND u.registration_complete = 1
+        WHERE u.role = 'attendant' AND u.registration_complete = 1 AND COALESCE(u.is_demo, 0) = 0
         GROUP BY u.email, u.name, u.role ORDER BY u.name`).all<{
           email: string;
           name: string;
@@ -63,6 +65,7 @@ export async function GET(request: Request) {
           calls: number;
           total: number;
           productiveSeconds: number;
+          activeDays: number;
         }>()
       : { results: [] };
 

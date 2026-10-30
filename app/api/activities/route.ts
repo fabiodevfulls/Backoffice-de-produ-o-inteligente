@@ -69,8 +69,8 @@ export async function POST(request: Request) {
 
     const db = await getDatabase();
     if (adminEntry) {
-      const target = await db.prepare("SELECT role, active FROM users WHERE lower(email) = ?").bind(targetEmail).first<{ role: string; active: number }>();
-      if (!target || target.role !== "attendant") return Response.json({ error: "Atendente não encontrado." }, { status: 404 });
+      const target = await db.prepare("SELECT role, active, COALESCE(is_demo, 0) AS isDemo FROM users WHERE lower(email) = ?").bind(targetEmail).first<{ role: string; active: number; isDemo: number }>();
+      if (!target || target.role !== "attendant" || target.isDemo) return Response.json({ error: "Atendente não encontrado." }, { status: 404 });
     }
     const typology = await db
       .prepare("SELECT id, name, seconds FROM typologies WHERE id = ? AND active = 1")
