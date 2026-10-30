@@ -7,12 +7,14 @@ export const users = sqliteTable(
     email: text("email").notNull(),
     name: text("name").notNull(),
     employeeCode: text("employee_code"),
+    profilePhoto: text("profile_photo"),
     role: text("role", { enum: ["supervisor", "attendant"] })
       .notNull()
       .default("attendant"),
     registrationComplete: integer("registration_complete", { mode: "boolean" })
       .notNull()
       .default(false),
+    isDemo: integer("is_demo", { mode: "boolean" }).notNull().default(false),
     createdAt: text("created_at").notNull(),
   },
   (table) => [uniqueIndex("users_email_unique").on(table.email)],

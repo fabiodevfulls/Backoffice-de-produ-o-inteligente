@@ -51,7 +51,7 @@ export async function POST(request: Request) {
       }
       const exists = await db.prepare("SELECT 1 AS found FROM users WHERE email = ?").bind(email).first<{ found: number }>();
       if (exists?.found) return Response.json({ error: "Já existe um cadastro com esse e-mail." }, { status: 409 });
-      const count = await db.prepare("SELECT COUNT(*) AS total FROM users WHERE role = 'attendant' AND email <> ?").bind(ADMIN_EMAIL).first<{ total: number }>();
+      const count = await db.prepare("SELECT COUNT(*) AS total FROM users WHERE role = 'attendant' AND COALESCE(is_demo, 0) = 0 AND email <> ?").bind(ADMIN_EMAIL).first<{ total: number }>();
       if ((count?.total ?? 0) >= MAX_ATTENDANTS) return Response.json({ error: `O limite de ${MAX_ATTENDANTS} atendentes foi atingido.` }, { status: 409 });
       await db.batch([
         db.prepare(`INSERT INTO users
@@ -70,7 +70,7 @@ export async function POST(request: Request) {
     if (email === ADMIN_EMAIL) return Response.json({ error: "Esse e-mail pertence ao administrador." }, { status: 400 });
 
     const db = await getDatabase();
-    const count = await db.prepare("SELECT COUNT(*) AS total FROM users WHERE role = 'attendant' AND email <> ?").bind(ADMIN_EMAIL).first<{ total: number }>();
+    const count = await db.prepare("SELECT COUNT(*) AS total FROM users WHERE role = 'attendant' AND COALESCE(is_demo, 0) = 0 AND email <> ?").bind(ADMIN_EMAIL).first<{ total: number }>();
     if ((count?.total ?? 0) >= MAX_ATTENDANTS) return Response.json({ error: `O limite de ${MAX_ATTENDANTS} atendentes foi atingido.` }, { status: 409 });
     const exists = await db.prepare("SELECT 1 AS found FROM users WHERE email = ?").bind(email).first<{ found: number }>();
     if (exists?.found) return Response.json({ error: "Já existe um cadastro com esse e-mail." }, { status: 409 });

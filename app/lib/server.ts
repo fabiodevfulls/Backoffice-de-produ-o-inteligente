@@ -6,6 +6,8 @@ export type AppUser = {
   role: AppRole;
   employeeCode: string | null;
   registrationComplete: boolean;
+  profilePhoto: string | null;
+  isDemo: boolean;
 };
 
 const DEFAULT_TYPOLOGIES = [
@@ -38,6 +40,7 @@ type RuntimeEnv = {
   GMAIL_REFRESH_TOKEN?: string;
   GMAIL_SENDER_EMAIL?: string;
   POWER_BI_API_KEY?: string;
+  DEMO_ACCESS_ENABLED?: string;
 };
 
 async function getRuntimeEnv(): Promise<RuntimeEnv> {
@@ -133,12 +136,14 @@ export async function ensureSchema() {
       email TEXT NOT NULL UNIQUE,
       name TEXT NOT NULL,
       employee_code TEXT,
+      profile_photo TEXT,
       role TEXT NOT NULL DEFAULT 'attendant',
       registration_complete INTEGER NOT NULL DEFAULT 0,
       password_hash TEXT,
       password_salt TEXT,
       active INTEGER NOT NULL DEFAULT 1,
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      is_demo INTEGER NOT NULL DEFAULT 0
     )`),
     db.prepare(`CREATE TABLE IF NOT EXISTS typologies (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -173,6 +178,24 @@ export async function ensureSchema() {
       last_sent_at TEXT NOT NULL,
       created_at TEXT NOT NULL
     )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS password_reset_verifications (
+      email TEXT PRIMARY KEY,
+      code_hash TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_sent_at TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS demo_access (
+      id TEXT PRIMARY KEY,
+      user_email TEXT NOT NULL UNIQUE,
+      token_hash TEXT NOT NULL UNIQUE,
+      created_by TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      consumed_at TEXT,
+      revoked_at TEXT
+    )`),
     db.prepare("CREATE INDEX IF NOT EXISTS activities_user_email_idx ON activities (user_email)"),
     db.prepare("CREATE INDEX IF NOT EXISTS activities_occurred_at_idx ON activities (occurred_at)"),
     db.prepare("CREATE INDEX IF NOT EXISTS activities_kind_idx ON activities (kind)"),
@@ -182,6 +205,9 @@ export async function ensureSchema() {
   const columnNames = new Set((userColumns.results ?? []).map((column) => column.name));
   if (!columnNames.has("employee_code")) {
     await db.prepare("ALTER TABLE users ADD COLUMN employee_code TEXT").run();
+  }
+  if (!columnNames.has("profile_photo")) {
+    await db.prepare("ALTER TABLE users ADD COLUMN profile_photo TEXT").run();
   }
   if (!columnNames.has("registration_complete")) {
     await db
@@ -196,6 +222,9 @@ export async function ensureSchema() {
   }
   if (!columnNames.has("active")) {
     await db.prepare("ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1").run();
+  }
+  if (!columnNames.has("is_demo")) {
+    await db.prepare("ALTER TABLE users ADD COLUMN is_demo INTEGER NOT NULL DEFAULT 0").run();
   }
 
   const activityColumns = await db.prepare("PRAGMA table_info(activities)").all<{ name: string }>();
@@ -268,7 +297,8 @@ export async function ensureCurrentUser(request: Request): Promise<AppUser | nul
   const db = await getDatabase();
   const existing = await db
     .prepare(`SELECT email, name, role, employee_code AS employeeCode,
-      registration_complete AS registrationComplete FROM users WHERE email = ?`)
+      registration_complete AS registrationComplete, profile_photo AS profilePhoto,
+      COALESCE(is_demo, 0) AS isDemo FROM users WHERE email = ?`)
     .bind(identity.email)
     .first<AppUser>();
   if (existing) {
@@ -282,6 +312,7 @@ export async function ensureCurrentUser(request: Request): Promise<AppUser | nul
     return {
       ...existing,
       registrationComplete: existing.role === "supervisor" || Boolean(existing.registrationComplete),
+      isDemo: Boolean(existing.isDemo),
     };
   }
 
@@ -295,7 +326,7 @@ export async function ensureCurrentUser(request: Request): Promise<AppUser | nul
       VALUES (?, ?, ?, ?, ?, ?)`)
     .bind(identity.email, identity.name, identity.employeeCode, role, registrationComplete ? 1 : 0, createdAt)
     .run();
-  return { email: identity.email, name: identity.name, role, employeeCode: identity.employeeCode, registrationComplete };
+  return { email: identity.email, name: identity.name, role, employeeCode: identity.employeeCode, registrationComplete, profilePhoto: null, isDemo: false };
 }
 
 export function apiError(error: unknown) {
