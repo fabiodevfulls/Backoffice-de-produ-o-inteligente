@@ -18,6 +18,7 @@
 
 * { box-sizing: border-box; }
 html { background: var(--bg); }
+html, body { max-width: 100%; overflow-x: clip; }
 body {
   margin: 0;
   background: radial-gradient(circle at 74% 0%, rgba(56, 189, 248, 0.07), transparent 26%), var(--bg);
@@ -25,10 +26,11 @@ body {
   font-family: var(--font-geist-sans), Inter, system-ui, sans-serif;
 }
 button, input, select { font: inherit; }
+img, canvas, video, svg { max-width: 100%; }
 button, a { -webkit-tap-highlight-color: transparent; }
 button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible { outline: 3px solid rgba(163, 230, 53, 0.35); outline-offset: 2px; }
 
-.app-shell { min-height: 100vh; display: grid; grid-template-columns: 250px minmax(0, 1fr); }
+.app-shell { min-height: 100vh; min-height: 100svh; display: grid; grid-template-columns: 250px minmax(0, 1fr); }
 .sidebar {
   position: sticky; top: 0; height: 100vh; z-index: 30;
   display: flex; flex-direction: column; padding: 24px 14px;
@@ -152,7 +154,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .record-period-filters select, .record-period-filters input { width: 100%; height: 42px; border: 1px solid #40536a; border-radius: 8px; padding: 0 11px; background: #071526; color: #fff; }
 .record-period-filters .record-calendar input { color-scheme: dark; border-color: var(--green); font-size: 15px; font-weight: 800; }
 .record-period-filters .record-calendar small { color: var(--muted); font-size: 10px; font-weight: 500; }
-.table-scroll { overflow-x: auto; }
+.table-scroll { max-width: 100%; overflow-x: auto; overscroll-behavior-inline: contain; -webkit-overflow-scrolling: touch; }
+.table-scroll table { min-width: 640px; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th { padding: 12px 14px; background: #0a1626; color: var(--muted); text-align: left; font-size: 10px; letter-spacing: .08em; text-transform: uppercase; white-space: nowrap; }
 td { padding: 13px 14px; border-bottom: 1px solid var(--border); color: #dbe4ef; vertical-align: middle; }
@@ -401,7 +404,7 @@ td a { color: var(--blue); font-weight: 700; text-decoration: none; }
 
 @media (max-width: 860px) {
   .app-shell { grid-template-columns: 1fr; }
-  .sidebar { position: fixed; left: 0; transform: translateX(-105%); width: 260px; transition: 220ms ease; box-shadow: 30px 0 60px rgba(0, 0, 0, .35); }
+  .sidebar { position: fixed; inset-block: 0; left: 0; transform: translateX(-105%); width: min(260px, 88vw); height: 100vh; height: 100dvh; overflow-y: auto; overscroll-behavior: contain; transition: 220ms ease; box-shadow: 30px 0 60px rgba(0, 0, 0, .35); }
   .sidebar.sidebar-open { transform: translateX(0); }
   .menu-button { display: block; }
   .menu-backdrop { display: block; position: fixed; inset: 0; z-index: 25; border: 0; background: rgba(0, 0, 0, .55); }
@@ -428,8 +431,20 @@ td a { color: var(--blue); font-weight: 700; text-decoration: none; }
 }
 
 @media (max-width: 600px) {
+  .topbar { min-height: 68px; gap: 10px; padding: 10px 12px; }
+  .topbar h1 { font-size: clamp(16px, 4.5vw, 20px); }
+  .topbar p { font-size: 11px; }
+  .topbar-user { gap: 8px; }
+  .avatar { width: 38px; height: 38px; }
+  .content { padding: 16px 12px 32px; }
+  .page-stack { gap: 16px; }
+  .panel { min-width: 0; }
+  .section-heading { flex-wrap: wrap; }
+  .report-one-metric { grid-template-columns: minmax(0, 1fr); }
   .report-toolbar { justify-items: stretch; width: 100%; }
   .report-toolbar select, .export-actions, .export-button { width: 100%; }
+  .report-filters { padding: 14px; }
+  .report-filters label { min-width: min(210px, 100%); }
   .report-period-grid { grid-template-columns: 1fr; }
   .report-range-note { display: grid; }
   .metric-grid, .report-metrics { grid-template-columns: 1fr; }
@@ -452,6 +467,16 @@ td a { color: var(--blue); font-weight: 700; text-decoration: none; }
   .break-panel { padding: 16px; }
   .break-panel .modal-actions { margin-top: 14px; }
   .break-floating-timer, .break-toast { right: 12px; bottom: 12px; }
+}
+
+@media (max-width: 380px) {
+  .content { padding-inline: 10px; }
+  .register-panel, .recent-panel, .team-panel, .records-panel, .chart-panel { padding: 14px; }
+  .metric-card { gap: 12px; padding: 15px; }
+  .metric-card strong { font-size: clamp(25px, 9vw, 34px); }
+  .activity-item { grid-template-columns: 34px minmax(0, 1fr); gap: 9px; }
+  .activity-meta { grid-column: 2; display: flex; justify-content: space-between; text-align: left; }
+  .auth-links { justify-content: flex-start; }
 }
 
 @media (prefers-reduced-motion: reduce) {
