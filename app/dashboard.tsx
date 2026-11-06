@@ -7,6 +7,7 @@ import { filterReportSelection, isDemoReportAccount, teamMemberProductivity } fr
 import { buildSapAdditionalFields, DENIAL_REASON_GROUPS, formatDenialReason } from "./intelligent-script.js";
 import { dailyProductionMetrics, productivityBand, summarizeSelectedDay } from "./lib/daily-productivity";
 import DemoAccessCard from "./demo-access/demo-access-card";
+import SupervisionOverview from "./supervision-overview";
 
 type Role = "supervisor" | "attendant";
 type ActivityKind = "protocol" | "call";
@@ -525,9 +526,7 @@ export default function Dashboard({
           ))}
         </nav>
         <div className="sidebar-footer">
-          <span className={`role-chip ${isSupervisor ? "supervisor" : "attendant"}`}>
-            {isSupervisor ? "Supervisão • leitura" : "Atendente"}
-          </span>
+          {isSupervisor ? <strong className="supervision-brand">Supervisão<br />em foco</strong> : <span className="role-chip attendant">Atendente</span>}
           <small>{data.currentUser.email || authUser.email}</small>
         </div>
       </aside>
@@ -776,7 +775,11 @@ function LoadingState() {
   );
 }
 
-function Overview({
+function Overview(props: Parameters<typeof LegacyOverview>[0]) {
+  return props.isSupervisor ? <SupervisionOverview accessToken={props.accessToken} team={props.data.team} settings={props.data.settings} /> : <LegacyOverview {...props} />;
+}
+
+function LegacyOverview({
   isSupervisor,
   data,
   productivity,
