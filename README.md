@@ -46,13 +46,20 @@ Sistema de produtividade para atendentes e supervisão, desenvolvido com Next.js
 
 Não publique `.dev.vars` e não coloque senhas no código.
 
-## Estrutura principal
+## Organização das pastas
 
-- `app/`: telas, autenticação, painel e APIs.
-- `app/lib/server.ts`: regras de usuário, supervisão e banco.
-- `worker/`: entrada do Cloudflare Worker.
-- `drizzle/`: migrações do banco D1.
-- `cloudflare-proxy/worker.js`: código do Worker usado no domínio `workers.dev` atual.
+- `app/`: páginas e rotas do sistema.
+- `app/components/supervision/`: interface e estilos do painel da supervisão.
+- `app/api/`: consultas e operações autenticadas.
+- `app/lib/`: regras de produtividade, autenticação e acesso aos dados.
+- `db/` e `drizzle/`: estrutura do banco e migrações.
+- `infrastructure/cloudflare/proxy/`: proxy do domínio anterior.
+- `worker/`: entrada da aplicação na Cloudflare.
+- `docs/power-bi/`: instruções e consulta da integração com Power BI.
+- `public/`: imagens, ícones e áudios.
+- `tests/`: verificações automatizadas.
+- `scripts/` e `build/`: preparação e validação da publicação.
+- `examples/`: exemplos de integração preservados.
 
 ## Verificações
 
@@ -65,4 +72,4 @@ npm test
 
 `https://controle-backoffice-arii.fabio-boy-2010-fs.workers.dev`
 
-O arquivo `cloudflare-proxy/worker.js` mantém esse domínio ligado à implantação atual do sistema.
+O arquivo `infrastructure/cloudflare/proxy/worker.js` mantém esse domínio ligado à implantação atual do sistema.

@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Activity, ClipboardList, Headset, Phone, TrendingUp, X } from "lucide-react";
 import { Area, Bar, CartesianGrid, ComposedChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { aggregateProduction, shiftDay, supervisionStatus, weekDays, type ProductionRow, type SupervisionMember } from "./lib/supervision";
+import { aggregateProduction, shiftDay, supervisionStatus, weekDays, type ProductionRow, type SupervisionMember } from "../../lib/supervision";
 
 type Member = { email: string; name: string };
 type Props = { accessToken: string; team: Member[]; settings: { workdaySeconds: number; goal: number } };

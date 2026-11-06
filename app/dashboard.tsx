@@ -7,7 +7,7 @@ import { filterReportSelection, isDemoReportAccount, teamMemberProductivity } fr
 import { buildSapAdditionalFields, DENIAL_REASON_GROUPS, formatDenialReason } from "./intelligent-script.js";
 import { dailyProductionMetrics, productivityBand, summarizeSelectedDay } from "./lib/daily-productivity";
 import DemoAccessCard from "./demo-access/demo-access-card";
-import SupervisionOverview from "./supervision-overview";
+import SupervisionOverview from "./components/supervision/overview";
 
 type Role = "supervisor" | "attendant";
 type ActivityKind = "protocol" | "call";
