@@ -2,6 +2,7 @@
 
 import { ChangeEvent, FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import Image from "next/image";
+import Link from "next/link";
 import { exportExcelReport, exportPdfReport } from "./report-export";
 import { filterReportSelection, isDemoReportAccount, teamMemberProductivity } from "./lib/report-selection";
 import { buildSapAdditionalFields, DENIAL_REASON_GROUPS, formatDenialReason } from "./intelligent-script.js";
@@ -103,6 +104,7 @@ type DashboardData = {
     employeeCode: string | null;
     registrationComplete: boolean;
     isAdmin: boolean;
+    isDemo?: boolean;
     profilePhoto: string | null;
   };
   typologies: Typology[];
@@ -547,6 +549,9 @@ export default function Dashboard({
         </header>
 
         <div className="content">
+          {data.currentUser.isDemo ? (
+            <Link className="secondary-button" href="/demo-access">Trocar área de teste</Link>
+          ) : null}
           {error ? <div className="alert error">{error}<button onClick={() => void loadDashboard()}>Tentar novamente</button></div> : null}
           {loading ? <LoadingState /> : null}
           {!loading && !error ? (
@@ -776,8 +781,44 @@ function LoadingState() {
   );
 }
 
+export function DemoSupervision() {
+  const today = todayInput();
+  const activities: Activity[] = [
+    { id: 1, userEmail: "ana@demo.invalid", userName: "Ana • Teste", kind: "protocol", protocol: "DEMO-001", outcome: "analysis", typologyId: 1, typologyName: "Análise de protocolo", quantity: 12, durationSeconds: 780, occurredAt: `${today}T11:30:00`, distributionState: null, backofficeUrl: null },
+    { id: 2, userEmail: "bruno@demo.invalid", userName: "Bruno • Teste", kind: "call", protocol: null, outcome: null, typologyId: 2, typologyName: "Atendimento telefônico", quantity: 18, durationSeconds: 540, occurredAt: `${today}T10:45:00`, distributionState: null, backofficeUrl: null },
+  ];
+  const team = activities.map((activity) => ({
+    email: activity.userEmail,
+    name: activity.userName,
+    protocols: activity.kind === "protocol" ? activity.quantity : 0,
+    calls: activity.kind === "call" ? activity.quantity : 0,
+    total: activity.quantity,
+    productiveSeconds: activity.durationSeconds * activity.quantity,
+    activeDays: 1,
+  }));
+  const data = { ...EMPTY_DATA, activities, team };
+  return (
+    <main className="workspace">
+      <header className="topbar">
+        <div>
+          <h1>Supervisão • Demonstração</h1>
+          <p>Equipe e registros fictícios</p>
+        </div>
+      </header>
+      <div className="content page-stack">
+        <div className="demo-access-actions">
+          <Link className="secondary-button" href="/demo-access">Trocar área de teste</Link>
+        </div>
+        <Overview isSupervisor demo data={data} productivity={0} todayProtocols={0}
+          todayCalls={0} todayProductiveSeconds={0} onSaved={async () => {}} accessToken="" />
+      </div>
+    </main>
+  );
+}
+
 function Overview({
   isSupervisor,
+  demo = false,
   data,
   productivity,
   todayProtocols,
@@ -787,6 +828,7 @@ function Overview({
   accessToken,
 }: {
   isSupervisor: boolean;
+  demo?: boolean;
   data: DashboardData;
   productivity: number;
   todayProtocols: number;
@@ -806,7 +848,7 @@ function Overview({
   const [monthlyReload, setMonthlyReload] = useState(0);
 
   useEffect(() => {
-    if (!isSupervisor || !accessToken) return;
+    if (demo || !isSupervisor || !accessToken) return;
     const controller = new AbortController();
     const params = new URLSearchParams({ month: productionMonth });
     if (overviewEmail !== "all") params.set("email", overviewEmail);
@@ -843,19 +885,28 @@ function Overview({
       if (!controller.signal.aborted) setMonthlyLoading(false);
     });
     return () => controller.abort();
-  }, [isSupervisor, accessToken, productionMonth, overviewEmail, monthlyReload]);
+  }, [demo, isSupervisor, accessToken, productionMonth, overviewEmail, monthlyReload]);
 
   const selectedOverviewMember = data.team.find((member) => member.email === overviewEmail);
+  const demoActivities = demo ? data.activities.filter((activity) =>
+    activity.occurredAt.startsWith(productionMonth) &&
+    (overviewEmail === "all" || activity.userEmail === overviewEmail)) : [];
+  const demoTeam = demo ? data.team.filter((member) =>
+    demoActivities.some((activity) => activity.userEmail === member.email)) : [];
   const overviewActivities = isSupervisor
-    ? monthlyActivities
+    ? (demo ? demoActivities : monthlyActivities)
     : overviewEmail === "all"
       ? data.activities
       : data.activities.filter((activity) => activity.userEmail === overviewEmail);
-  const visibleMonthlyTeam = overviewEmail === "all"
+  const visibleMonthlyTeam = demo ? demoTeam : overviewEmail === "all"
     ? monthlyTeam
     : monthlyTeam.filter((member) => member.email === overviewEmail);
+  const visibleDailyRows = demo ? demoTeam.map((member) => ({
+    ...member,
+    date: todayInput(),
+  })) : dailyProductionRows;
   const selectedDayProduction = summarizeSelectedDay(
-    dailyProductionRows,
+    visibleDailyRows,
     selectedProductionDay,
     data.settings.workdaySeconds,
   );
@@ -897,7 +948,7 @@ function Overview({
       {isSupervisor ? (
         <div className="dashboard-grid supervisor-grid">
           <MonthlyTeamSummary team={visibleMonthlyTeam} monthLabel={monthLabel} loading={monthlyLoading} workdaySeconds={data.settings.workdaySeconds} />
-          <RecentActivities activities={overviewActivities} supervisor />
+          <RecentActivities activities={overviewActivities} supervisor demo={demo} />
         </div>
       ) : (
         <div className="dashboard-grid">
@@ -964,11 +1015,11 @@ function ActivityForm({ typologies, onSaved, accessToken }: { typologies: Typolo
   );
 }
 
-function RecentActivities({ activities, supervisor = false }: { activities: Activity[]; supervisor?: boolean }) {
+function RecentActivities({ activities, supervisor = false, demo = false }: { activities: Activity[]; supervisor?: boolean; demo?: boolean }) {
   const recent = activities.slice(0, 8);
   return (
     <section className="panel recent-panel">
-      <div className="section-heading"><div><p className="eyebrow">ATUALIZAÇÃO AUTOMÁTICA</p><h2>{supervisor ? "Últimos registros da equipe" : "Meus últimos registros"}</h2></div><span className="live-dot">Ao vivo</span></div>
+      <div className="section-heading"><div><p className="eyebrow">{demo ? "DADOS DE TESTE" : "ATUALIZAÇÃO AUTOMÁTICA"}</p><h2>{supervisor ? "Últimos registros da equipe" : "Meus últimos registros"}</h2></div>{demo ? null : <span className="live-dot">Ao vivo</span>}</div>
       {recent.length ? <div className="activity-list">{recent.map((activity) => (
         <article className="activity-item" key={activity.id}>
           <span className={`kind-badge ${activity.kind}`}>{activity.kind === "protocol" ? "P" : "L"}</span>

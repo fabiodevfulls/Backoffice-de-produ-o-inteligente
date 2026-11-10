@@ -31,6 +31,22 @@ test("demo sessions are capped at one hour and test user stays out of production
 });
 
 test("production deployment explicitly enables the demo access until the app-level expiry", async () => {
-  const config = JSON.parse(await read("deploy-ready/wrangler.jsonc"));
-  assert.equal(config.vars.DEMO_ACCESS_ENABLED, "true");
+  const config = await read("wrangler.jsonc");
+  assert.match(config, /"DEMO_ACCESS_ENABLED"\s*:\s*"true"/);
+});
+
+
+test("the redeemed QR offers both modes without giving the demo user a production supervisor role", async () => {
+  const form = await read("app/demo-access/demo-access-form.tsx");
+  const page = await read("app/demo-access/supervision/page.tsx");
+  const session = await read("app/lib/demo-session.ts");
+  const store = await read("app/lib/demo-access-store.ts");
+  const dashboard = await read("app/dashboard.tsx");
+
+  assert.match(form, /href="\/">Atendimento<\/Link>/);
+  assert.match(form, /href="\/demo-access\/supervision">Supervisão<\/Link>/);
+  assert.match(page, /if \(!await hasActiveDemoSession\(await headers\(\)\)\) redirect/);
+  assert.match(session, /revoked_at IS NULL AND expires_at > \?/);
+  assert.match(store, /'attendant'/);
+  assert.match(dashboard, /if \(demo \|\| !isSupervisor \|\| !accessToken\) return/);
 });
