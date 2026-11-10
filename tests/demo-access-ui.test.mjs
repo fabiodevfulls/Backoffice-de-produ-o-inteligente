@@ -48,5 +48,7 @@ test("the redeemed QR offers both modes without giving the demo user a productio
   assert.match(page, /if \(!await hasActiveDemoSession\(await headers\(\)\)\) redirect/);
   assert.match(session, /revoked_at IS NULL AND expires_at > \?/);
   assert.match(store, /'attendant'/);
-  assert.match(dashboard, /if \(demo \|\| !isSupervisor \|\| !accessToken\) return/);
+  assert.match(dashboard, /<SupervisionOverview[\s\S]*demoRows=\{demoData/);
+  const overview = await read("app/components/supervision/overview.tsx");
+  assert.match(overview, /if \(demoRows\) return/);
 });

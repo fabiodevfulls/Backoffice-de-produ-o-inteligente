@@ -6,7 +6,9 @@ import Link from "next/link";
 import { exportExcelReport, exportPdfReport } from "./report-export";
 import { filterReportSelection, isDemoReportAccount, teamMemberProductivity } from "./lib/report-selection";
 import { buildSapAdditionalFields, DENIAL_REASON_GROUPS, formatDenialReason } from "./intelligent-script.js";
-import { dailyProductionMetrics, productivityBand, summarizeSelectedDay } from "./lib/daily-productivity";
+import { productivityBand } from "./lib/daily-productivity";
+import SupervisionOverview from "./components/supervision/overview";
+import { shiftDay, supervisionToday } from "./lib/supervision";
 import DemoAccessCard from "./demo-access/demo-access-card";
 
 type Role = "supervisor" | "attendant";
@@ -94,8 +96,6 @@ type TeamMember = {
   productiveSeconds: number;
   activeDays: number;
 };
-type MonthlyTeamMember = TeamMember;
-type AttendantDayProduction = { date: string; email: string; name: string; productiveSeconds: number; protocols: number; calls: number; total: number };
 type DashboardData = {
   currentUser: {
     email: string;
@@ -410,13 +410,15 @@ export default function Dashboard({
   authUser,
   accessToken,
   onSignOut: externalSignOut,
+  demoData,
 }: {
   authUser: { displayName: string; email: string };
   accessToken: string;
   onSignOut?: () => Promise<void>;
+  demoData?: DashboardData;
 }) {
-  const [data, setData] = useState<DashboardData>(EMPTY_DATA);
-  const [loading, setLoading] = useState(true);
+  const [data, setData] = useState<DashboardData>(demoData ?? EMPTY_DATA);
+  const [loading, setLoading] = useState(!demoData);
   const [error, setError] = useState("");
   const [tab, setTab] = useState<Tab>("overview");
   const [menuOpen, setMenuOpen] = useState(false);
@@ -430,6 +432,7 @@ export default function Dashboard({
   };
 
   const loadDashboard = useCallback(async () => {
+    if (demoData) return;
     setLoading(true);
     setError("");
     try {
@@ -445,7 +448,7 @@ export default function Dashboard({
     } finally {
       setLoading(false);
     }
-  }, [accessToken]);
+  }, [accessToken, demoData]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => void loadDashboard(), 0);
@@ -539,7 +542,7 @@ export default function Dashboard({
           <button className="menu-button" type="button" onClick={() => setMenuOpen(!menuOpen)} aria-label="Abrir menu">☰</button>
           <div>
             <h1>Controle de Produtividade <span>•</span> Backoffice</h1>
-            <p>{isSupervisor ? "Acompanhamento da equipe" : "Meus protocolos e ligações"}</p>
+            <p>{isSupervisor ? demoData ? "Demonstração • equipe e registros fictícios" : "Acompanhamento da equipe" : "Meus protocolos e ligações"}</p>
           </div>
           <div className="topbar-user">
             <span className="today-label">{new Date().toLocaleDateString("pt-BR", { day: "2-digit", month: "long", year: "numeric" })}</span>
@@ -556,9 +559,16 @@ export default function Dashboard({
           {loading ? <LoadingState /> : null}
           {!loading && !error ? (
             <>
-              {tab === "overview" && (
+              {tab === "overview" && (isSupervisor ? (
+                <SupervisionOverview accessToken={accessToken} team={data.team} settings={data.settings}
+                  demoRows={demoData?.activities.map((activity) => ({
+                    date: activity.occurredAt.slice(0, 10), email: activity.userEmail, name: activity.userName,
+                    protocols: activity.kind === "protocol" ? activity.quantity : 0,
+                    calls: activity.kind === "call" ? activity.quantity : 0,
+                    total: activity.quantity, productiveSeconds: activity.durationSeconds * activity.quantity,
+                  }))} />
+              ) : (
                 <Overview
-                  isSupervisor={isSupervisor}
                   data={data}
                   productivity={productivity}
                   todayProtocols={todayProtocols}
@@ -567,7 +577,7 @@ export default function Dashboard({
                   onSaved={loadDashboard}
                   accessToken={accessToken}
                 />
-              )}
+              ))}
               {tab === "calculator" && !isSupervisor && <Calculator data={data} />}
               {tab === "scripts" && !isSupervisor && <Scripts />}
               {!isSupervisor && (
@@ -590,7 +600,7 @@ export default function Dashboard({
               {tab === "report" && (
                 <ProductionReports data={data} isSupervisor={isSupervisor} />
               )}
-              {tab === "profile" && <Profile data={data} accessToken={accessToken} onUpdated={loadDashboard} />}
+              {tab === "profile" && <Profile data={data} accessToken={accessToken} onUpdated={loadDashboard} readOnly={Boolean(demoData)} />}
               {tab === "team" && isSupervisor && <div className="page-stack"><Team data={data} />{data.currentUser.isAdmin ? <Attendants typologies={data.typologies} onChanged={loadDashboard} /> : null}</div>}
             </>
           ) : null}
@@ -703,7 +713,7 @@ function compressProfilePhoto(file: File) {
   });
 }
 
-function Profile({ data, accessToken, onUpdated }: { data: DashboardData; accessToken: string; onUpdated: () => Promise<void> }) {
+function Profile({ data, accessToken, onUpdated, readOnly = false }: { data: DashboardData; accessToken: string; onUpdated: () => Promise<void>; readOnly?: boolean }) {
   const [name, setName] = useState(data.currentUser.name);
   const [profilePhoto, setProfilePhoto] = useState(data.currentUser.profilePhoto);
   const [message, setMessage] = useState("");
@@ -727,6 +737,7 @@ function Profile({ data, accessToken, onUpdated }: { data: DashboardData; access
 
   async function saveProfile(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (readOnly) return;
     setSaving(true);
     setMessage("");
     setMessageType("");
@@ -754,19 +765,19 @@ function Profile({ data, accessToken, onUpdated }: { data: DashboardData; access
     <section className="panel profile-panel">
       <div className="profile-photo-column">
         <div className="profile-photo-preview">{profilePhoto ? <Image src={profilePhoto} alt={`Foto de perfil de ${name}`} width={176} height={176} unoptimized /> : <span>{initials}</span>}</div>
-        <label className="secondary-button profile-photo-button">Escolher foto<input type="file" accept="image/jpeg,image/png,image/webp" onChange={(event) => void choosePhoto(event)} /></label>
-        {profilePhoto ? <button type="button" className="profile-remove-photo" onClick={() => setProfilePhoto(null)}>Remover foto</button> : null}
+        {readOnly ? null : <label className="secondary-button profile-photo-button">Escolher foto<input type="file" accept="image/jpeg,image/png,image/webp" onChange={(event) => void choosePhoto(event)} /></label>}
+        {!readOnly && profilePhoto ? <button type="button" className="profile-remove-photo" onClick={() => setProfilePhoto(null)}>Remover foto</button> : null}
         <small>JPG, PNG ou WebP. A foto é reduzida para caber no perfil.</small>
       </div>
       <form className="profile-form" onSubmit={saveProfile}>
         <div><p className="eyebrow">DADOS DO PERFIL</p><h3>Informações da conta</h3><p>Seu e-mail e seu tipo de acesso são administrados pelo sistema.</p></div>
-        <label className="field"><span>Nome de exibição</span><input value={name} onChange={(event) => setName(event.target.value)} minLength={3} maxLength={120} required /></label>
+        <label className="field"><span>Nome de exibição</span><input value={name} readOnly={readOnly} onChange={(event) => setName(event.target.value)} minLength={3} maxLength={120} required /></label>
         <div className="profile-info-grid">
           <label className="field"><span>E-mail de acesso</span><input value={data.currentUser.email} readOnly /></label>
           <label className="field"><span>Tipo de acesso</span><input value={data.currentUser.role === "supervisor" ? "Supervisão" : "Atendente"} readOnly /></label>
           <label className="field"><span>Matrícula ou identificação</span><input value={data.currentUser.employeeCode || "Não informada"} readOnly /></label>
         </div>
-        <button className="primary-button profile-save-button" type="submit" disabled={saving}>{saving ? "Salvando perfil…" : "Salvar alterações"}</button>
+        {readOnly ? null : <button className="primary-button profile-save-button" type="submit" disabled={saving}>{saving ? "Salvando perfil…" : "Salvar alterações"}</button>}
         {message ? <p className={`form-status ${messageType}`} role={messageType === "error" ? "alert" : "status"}>{message}</p> : null}
       </form>
     </section>
@@ -782,53 +793,33 @@ function LoadingState() {
 }
 
 export function DemoSupervision() {
-  const today = todayInput();
-  const activities: Activity[] = [
-    { id: 1, userEmail: "ana@demo.invalid", userName: "Ana • Teste", kind: "protocol", protocol: "DEMO-001", outcome: "analysis", typologyId: 1, typologyName: "Análise de protocolo", quantity: 12, durationSeconds: 780, occurredAt: `${today}T11:30:00`, distributionState: null, backofficeUrl: null },
-    { id: 2, userEmail: "bruno@demo.invalid", userName: "Bruno • Teste", kind: "call", protocol: null, outcome: null, typologyId: 2, typologyName: "Atendimento telefônico", quantity: 18, durationSeconds: 540, occurredAt: `${today}T10:45:00`, distributionState: null, backofficeUrl: null },
-  ];
-  const team = activities.map((activity) => ({
-    email: activity.userEmail,
-    name: activity.userName,
-    protocols: activity.kind === "protocol" ? activity.quantity : 0,
-    calls: activity.kind === "call" ? activity.quantity : 0,
-    total: activity.quantity,
-    productiveSeconds: activity.durationSeconds * activity.quantity,
-    activeDays: 1,
-  }));
-  const data = { ...EMPTY_DATA, activities, team };
-  return (
-    <main className="workspace">
-      <header className="topbar">
-        <div>
-          <h1>Supervisão • Demonstração</h1>
-          <p>Equipe e registros fictícios</p>
-        </div>
-      </header>
-      <div className="content page-stack">
-        <div className="demo-access-actions">
-          <Link className="secondary-button" href="/demo-access">Trocar área de teste</Link>
-        </div>
-        <Overview isSupervisor demo data={data} productivity={0} todayProtocols={0}
-          todayCalls={0} todayProductiveSeconds={0} onSaved={async () => {}} accessToken="" />
-      </div>
-    </main>
-  );
+  const date = supervisionToday();
+  const activities: Activity[] = Array.from({ length: 5 }, (_, index) => {
+    const day = shiftDay(date, -index);
+    return [
+      { id: index * 2 + 1, userEmail: "ana@example.test", userName: "Ana • Teste", kind: "protocol", protocol: `DEMO-${index + 1}`, outcome: "analysis", typologyId: 1, typologyName: "Análise de protocolo", quantity: 12 + index, durationSeconds: 980, occurredAt: `${day}T11:30:00`, distributionState: null, backofficeUrl: null },
+      { id: index * 2 + 2, userEmail: "bruno@example.test", userName: "Bruno • Teste", kind: "call", protocol: null, outcome: null, typologyId: 2, typologyName: "Atendimento telefônico", quantity: 24 + (index % 3) * 5, durationSeconds: 580, occurredAt: `${day}T10:45:00`, distributionState: null, backofficeUrl: null },
+    ] satisfies Activity[];
+  }).flat();
+  const team = activities.slice(0, 2).map(({ userEmail: email, userName: name }) => {
+    const records = activities.filter((activity) => activity.userEmail === email);
+    const protocols = records.reduce((sum, activity) => sum + (activity.kind === "protocol" ? activity.quantity : 0), 0);
+    const calls = records.reduce((sum, activity) => sum + (activity.kind === "call" ? activity.quantity : 0), 0);
+    return { email, name, protocols, calls, total: protocols + calls,
+      productiveSeconds: records.reduce((sum, activity) => sum + activity.durationSeconds * activity.quantity, 0),
+      activeDays: records.length };
+  });
+  const currentUser: DashboardData["currentUser"] = {
+    ...EMPTY_DATA.currentUser, name: "Supervisão de teste", email: "supervisao@example.test",
+    role: "supervisor", registrationComplete: true, isDemo: true,
+  };
+  return <Dashboard authUser={{ displayName: currentUser.name, email: currentUser.email }}
+    accessToken="" demoData={{ ...EMPTY_DATA, currentUser, activities, team }} />;
 }
 
 function Overview({
-  isSupervisor,
-  demo = false,
-  data,
-  productivity,
-  todayProtocols,
-  todayCalls,
-  todayProductiveSeconds,
-  onSaved,
-  accessToken,
+  data, productivity, todayProtocols, todayCalls, todayProductiveSeconds, onSaved, accessToken,
 }: {
-  isSupervisor: boolean;
-  demo?: boolean;
   data: DashboardData;
   productivity: number;
   todayProtocols: number;
@@ -837,127 +828,24 @@ function Overview({
   onSaved: () => Promise<void>;
   accessToken: string;
 }) {
-  const [overviewEmail, setOverviewEmail] = useState("all");
-  const [productionMonth, setProductionMonth] = useState(monthInput);
-  const [selectedProductionDay, setSelectedProductionDay] = useState(todayInput);
-  const [monthlyTeam, setMonthlyTeam] = useState<MonthlyTeamMember[]>([]);
-  const [dailyProductionRows, setDailyProductionRows] = useState<AttendantDayProduction[]>([]);
-  const [monthlyActivities, setMonthlyActivities] = useState<Activity[]>([]);
-  const [monthlyLoading, setMonthlyLoading] = useState(false);
-  const [monthlyError, setMonthlyError] = useState("");
-  const [monthlyReload, setMonthlyReload] = useState(0);
-
-  useEffect(() => {
-    if (demo || !isSupervisor || !accessToken) return;
-    const controller = new AbortController();
-    const params = new URLSearchParams({ month: productionMonth });
-    if (overviewEmail !== "all") params.set("email", overviewEmail);
-    void Promise.resolve().then(() => {
-      setMonthlyLoading(true);
-      setMonthlyError("");
-      setMonthlyTeam([]);
-      setDailyProductionRows([]);
-      setMonthlyActivities([]);
-      return fetch(`/api/supervisor/monthly-production?${params}`, {
-        cache: "no-store",
-        headers: { authorization: `Bearer ${accessToken}` },
-        signal: controller.signal,
-      });
-    }).then(async (response) => {
-      const result = await response.json() as {
-        month?: string;
-        team?: MonthlyTeamMember[];
-        dailyProduction?: AttendantDayProduction[];
-        recentActivities?: Activity[];
-        error?: string;
-      };
-      if (!response.ok) throw new Error(result.error || "Não foi possível carregar a produção mensal.");
-      setMonthlyTeam(result.team ?? []);
-      setDailyProductionRows(result.dailyProduction ?? []);
-      setMonthlyActivities(result.recentActivities ?? []);
-    }).catch((loadError: unknown) => {
-      if (controller.signal.aborted) return;
-      setMonthlyError(loadError instanceof Error ? loadError.message : "Não foi possível carregar a produção mensal.");
-      setMonthlyTeam([]);
-      setDailyProductionRows([]);
-      setMonthlyActivities([]);
-    }).finally(() => {
-      if (!controller.signal.aborted) setMonthlyLoading(false);
-    });
-    return () => controller.abort();
-  }, [demo, isSupervisor, accessToken, productionMonth, overviewEmail, monthlyReload]);
-
-  const selectedOverviewMember = data.team.find((member) => member.email === overviewEmail);
-  const demoActivities = demo ? data.activities.filter((activity) =>
-    activity.occurredAt.startsWith(productionMonth) &&
-    (overviewEmail === "all" || activity.userEmail === overviewEmail)) : [];
-  const demoTeam = demo ? data.team.filter((member) =>
-    demoActivities.some((activity) => activity.userEmail === member.email)) : [];
-  const overviewActivities = isSupervisor
-    ? (demo ? demoActivities : monthlyActivities)
-    : overviewEmail === "all"
-      ? data.activities
-      : data.activities.filter((activity) => activity.userEmail === overviewEmail);
-  const visibleMonthlyTeam = demo ? demoTeam : overviewEmail === "all"
-    ? monthlyTeam
-    : monthlyTeam.filter((member) => member.email === overviewEmail);
-  const visibleDailyRows = demo ? demoTeam.map((member) => ({
-    ...member,
-    date: todayInput(),
-  })) : dailyProductionRows;
-  const selectedDayProduction = summarizeSelectedDay(
-    visibleDailyRows,
-    selectedProductionDay,
-    data.settings.workdaySeconds,
-  );
-  const selectedDayLabel = selectedProductionDay
-    ? new Date(`${selectedProductionDay}T12:00:00`).toLocaleDateString("pt-BR", { weekday: "long", day: "2-digit", month: "long", year: "numeric" })
-    : "dia selecionado";
-  const monthLabel = productionMonth
-    ? new Date(`${productionMonth}-01T12:00:00`).toLocaleDateString("pt-BR", { month: "long", year: "numeric" })
-    : "mês selecionado";
-  const selectedDayMetrics = dailyProductionMetrics(selectedDayProduction.attendants);
-  const cards = isSupervisor
-    ? [
-        { label: "Atendentes com produção no dia", value: monthlyLoading ? "…" : String(selectedDayMetrics.producingAttendants), icon: "◎", tone: "blue" },
-        { label: "Protocolos no dia", value: monthlyLoading ? "…" : String(selectedDayMetrics.protocols), icon: "▤", tone: "blue" },
-        { label: "Ligações no dia", value: monthlyLoading ? "…" : String(selectedDayMetrics.calls), icon: "◖", tone: "green" },
-        { label: "Atividades no dia", value: monthlyLoading ? "…" : String(selectedDayMetrics.total), icon: "◷", tone: "green" },
-      ]
-    : [
-        { label: "Produtividade hoje", value: formatPercent(productivity), icon: "↗", tone: "green" },
-        { label: "Protocolos hoje", value: String(todayProtocols), icon: "▤", tone: "blue" },
-        { label: "Ligações hoje", value: String(todayCalls), icon: "◖", tone: "blue" },
-        { label: "Tempo produtivo", value: formatDuration(todayProductiveSeconds), icon: "◷", tone: "green" },
-      ];
-
-  return (
-    <div className="page-stack">
-      {isSupervisor ? <section className="panel overview-scope-filter"><div><p className="eyebrow">PRODUÇÃO DA SUPERVISÃO</p><h2>Consulte por data</h2><p>Escolha um dia para ver a produção e a produtividade registradas.</p></div><label><span>Escolher dia</span><input type="date" value={selectedProductionDay} onChange={(event) => { const date = event.target.value || todayInput(); setSelectedProductionDay(date); setProductionMonth(date.slice(0, 7)); }} /></label></section> : null}
-      {isSupervisor && monthlyError ? <div className="alert error" role="alert">{monthlyError}<button type="button" onClick={() => setMonthlyReload((count) => count + 1)}>Tentar novamente</button></div> : null}
-      {isSupervisor ? <section className="panel selected-day-panel"><div className="selected-day-heading"><div><p className="eyebrow">PRODUÇÃO DE {selectedDayLabel}</p><p>{overviewEmail === "all" ? "Média da equipe e produção por atendente" : `Resultado individual: ${selectedOverviewMember?.name ?? "Atendente"}`}</p></div><div className="selected-day-average"><small>Média de produtividade</small>{selectedDayProduction.attendants.length ? <strong className={productivityBand(selectedDayProduction.average)}>{formatPercent(selectedDayProduction.average)}</strong> : <strong>{monthlyLoading ? "Carregando…" : "Sem produção registrada"}</strong>}</div></div><label className="daily-attendant-filter"><span>Atendente</span><select value={overviewEmail} onChange={(event) => setOverviewEmail(event.target.value)}><option value="all">Equipe geral</option>{data.team.map((member) => <option key={member.email} value={member.email}>{member.name}</option>)}</select></label>{monthlyLoading ? <p className="no-daily-production" role="status">Carregando a produção da data selecionada…</p> : selectedDayProduction.attendants.length ? <div className="table-scroll"><table><thead><tr><th>Atendente</th><th>Protocolos</th><th>Ligações</th><th>Total do dia</th><th>Tempo produtivo</th><th>Produtividade</th></tr></thead><tbody>{selectedDayProduction.attendants.map((attendant) => <tr key={attendant.email}><td><strong>{attendant.name}</strong></td><td>{attendant.protocols}</td><td>{attendant.calls}</td><td>{attendant.total}</td><td>{formatDuration(attendant.productiveSeconds)}</td><td><span className={`score-pill ${productivityBand(attendant.productivity)}`}>{formatPercent(attendant.productivity)}</span></td></tr>)}</tbody></table></div> : <p className="no-daily-production">Não há registros de produção para esta data e este filtro.</p>}</section> : null}
-      <section className={`metric-grid${isSupervisor ? " supervisor-metric-grid" : ""}`}>
-        {cards.map((card) => (
-          <article className="metric-card" key={card.label}>
-            <span className={`metric-icon ${card.tone}`}>{card.icon}</span>
-            <div><small>{card.label}</small><strong>{card.value}</strong></div>
-          </article>
-        ))}
-      </section>
-
-      {isSupervisor ? (
-        <div className="dashboard-grid supervisor-grid">
-          <MonthlyTeamSummary team={visibleMonthlyTeam} monthLabel={monthLabel} loading={monthlyLoading} workdaySeconds={data.settings.workdaySeconds} />
-          <RecentActivities activities={overviewActivities} supervisor demo={demo} />
-        </div>
-      ) : (
-        <div className="dashboard-grid">
-          <ActivityForm typologies={data.typologies} onSaved={onSaved} accessToken={accessToken} />
-          <RecentActivities activities={data.activities} />
-        </div>
-      )}
+  const cards = [
+    { label: "Produtividade hoje", value: formatPercent(productivity), icon: "↗", tone: "green" },
+    { label: "Protocolos hoje", value: String(todayProtocols), icon: "▤", tone: "blue" },
+    { label: "Ligações hoje", value: String(todayCalls), icon: "◖", tone: "blue" },
+    { label: "Tempo produtivo", value: formatDuration(todayProductiveSeconds), icon: "◷", tone: "green" },
+  ];
+  return <div className="page-stack">
+    <section className="metric-grid">{cards.map((card) => (
+      <article className="metric-card" key={card.label}>
+        <span className={`metric-icon ${card.tone}`}>{card.icon}</span>
+        <div><small>{card.label}</small><strong>{card.value}</strong></div>
+      </article>
+    ))}</section>
+    <div className="dashboard-grid">
+      <ActivityForm typologies={data.typologies} onSaved={onSaved} accessToken={accessToken} />
+      <RecentActivities activities={data.activities} />
     </div>
-  );
+  </div>;
 }
 
 function ActivityForm({ typologies, onSaved, accessToken }: { typologies: Typology[]; onSaved: () => Promise<void>; accessToken: string }) {
@@ -1535,20 +1423,6 @@ function ProductionReports({ data, isSupervisor }: { data: DashboardData; isSupe
 
 function Team({ data }: { data: DashboardData }) {
   return <div className="page-stack"><div className="page-title"><div><p className="eyebrow">ACESSO DA SUPERVISÃO</p><h2>Desempenho da equipe</h2><p>Somente visualização: nenhum registro pode ser criado ou alterado aqui.</p></div></div><TeamSummary data={data} /></div>;
-}
-
-function MonthlyTeamSummary({ team, monthLabel, loading, workdaySeconds }: { team: MonthlyTeamMember[]; monthLabel: string; loading: boolean; workdaySeconds: number }) {
-  return (
-    <section className="panel team-panel monthly-team-panel">
-      <div className="section-heading"><div><p className="eyebrow">PRODUÇÃO DO MÊS</p><h2>Resultado por atendente</h2><p>Período: {monthLabel}</p></div><span className="permission-tag readonly">Somente leitura</span></div>
-      {loading ? <p className="monthly-loading" role="status">Carregando produção mensal...</p>
-        : team.length ? <div className="table-scroll"><table><thead><tr><th>Atendente</th><th>Protocolos</th><th>Ligações</th><th>Total</th><th>Tempo produtivo</th><th>Dias ativos</th><th>Produtividade média do mês</th></tr></thead><tbody>{team.map((member) => {
-          const score = member.activeDays ? member.productiveSeconds / (workdaySeconds * member.activeDays) : 0;
-          return <tr key={member.email}><td><strong>{member.name}</strong><small>{member.email}</small></td><td>{member.protocols}</td><td>{member.calls}</td><td><strong>{member.total}</strong></td><td>{formatDuration(member.productiveSeconds)}</td><td>{member.activeDays}</td><td>{member.activeDays ? <span className={`score-pill ${productivityBand(score)}`}>{formatPercent(score)}</span> : "—"}</td></tr>;
-        })}</tbody></table></div>
-          : <EmptyState title="Nenhum atendente identificado" text={`Os atendentes aparecerão aqui quando houver produção em ${monthLabel}.`} />}
-    </section>
-  );
 }
 
 function TeamSummary({ data, compact = false }: { data: DashboardData; compact?: boolean }) {

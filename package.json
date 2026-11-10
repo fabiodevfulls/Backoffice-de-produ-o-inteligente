@@ -1,5 +1,5 @@
 {
-  "name": "site-creator-vinext-starter",
+  "name": "backoffice-producao",
   "version": "0.1.0",
   "private": true,
   "engines": {
@@ -10,7 +10,7 @@
     "dev": "vite",
     "build": "node scripts/build-verified.mjs",
     "start": "vinext start",
-    "test": "npm run build && npm run typecheck && node --test tests/rendered-html.test.mjs tests/daily-productivity.test.mjs tests/report-selection.test.mjs tests/profile.test.mjs tests/supervisor-data.test.mjs tests/supervisor-ui.test.mjs tests/particle-sphere.test.mjs tests/demo-access.test.mjs tests/demo-access-ui.test.mjs",
+    "test": "npm run build && npm run typecheck && node --test tests/supervision.test.mjs tests/rendered-html.test.mjs tests/daily-productivity.test.mjs tests/report-selection.test.mjs tests/profile.test.mjs tests/supervisor-data.test.mjs tests/supervisor-ui.test.mjs tests/particle-sphere.test.mjs tests/demo-access.test.mjs tests/demo-access-ui.test.mjs",
     "validate:artifact": "node scripts/validate-artifact.mjs",
     "typecheck": "tsc --noEmit",
     "types": "wrangler types worker-configuration.d.ts --config ./wrangler.jsonc",
@@ -20,10 +20,12 @@
   "dependencies": {
     "@supabase/supabase-js": "^2.111.0",
     "drizzle-orm": "0.45.2",
+    "lucide-react": "^1.69.0",
     "next": "16.2.6",
     "qrcode": "^1.5.4",
     "react": "19.2.6",
-    "react-dom": "19.2.6"
+    "react-dom": "19.2.6",
+    "recharts": "^3.10.1"
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "1.37.1",
